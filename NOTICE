@@ -1,0 +1,39 @@
+MarketMind AI
+Copyright 2026 Sudeep Dasgupta
+
+This product includes software developed by Sudeep Dasgupta and contributors.
+
+Licensed under the Apache License, Version 2.0. See LICENSE for details.
+
+─────────────────────────────────────────────────────────────────────────────
+Third-party components (used under their respective licenses):
+
+  FastAPI            — MIT License
+  Uvicorn            — BSD-3-Clause
+  PyTorch            — BSD-3-Clause
+  pandas             — BSD-3-Clause
+  numpy              — BSD-3-Clause
+  scikit-learn       — BSD-3-Clause
+  statsmodels        — BSD-3-Clause
+  arch (GARCH)       — BSD-3-Clause
+  hmmlearn           — BSD-3-Clause
+  ChromaDB           — Apache-2.0
+  pymongo            — Apache-2.0
+  Anthropic SDK      — MIT License
+  KiteConnect SDK    — MIT License (Zerodha)
+  ta (technical)     — MIT License
+  beautifulsoup4     — MIT License
+
+Data sources (live, not bundled):
+
+  Zerodha Kite Connect      — broker API; requires user account & API subscription
+  NSE India (nseindia.com)  — public market data; usage subject to NSE T&C
+  BSE India (bseindia.com)  — public corporate filings
+  Screener.in               — fundamentals (use within their fair-use policy)
+  Google News RSS           — news headlines
+  Anthropic Claude API      — LLM inference (commercial)
+
+This software is not affiliated with, endorsed by, or sponsored by Zerodha,
+NSE, BSE, SEBI, Anthropic, or any data provider listed above.
+
+NOT FINANCIAL ADVICE. See README.md "Disclaimer" section.
