@@ -1071,6 +1071,96 @@ async def get_portfolio():
     return JSONResponse(_sanitize(summary))
 
 
+class LotPayload(BaseModel):
+    """Per-lot acquisition data for `lots_override` (W4.1).
+
+    Lets callers with their own lot ledger (broker-statement CSV, etc.)
+    bypass the UNKNOWN-date STCG worst-case fallback that fires when Kite's
+    `holdings()` is the only source. `acquisition_date` is ISO YYYY-MM-DD or
+    None (treated as UNKNOWN, same as the no-ledger path).
+    """
+    quantity: float
+    cost_basis: float
+    acquisition_date: Optional[str] = None  # ISO YYYY-MM-DD
+
+
+class TaxRebalanceRequest(BaseModel):
+    """Body schema for POST /api/portfolio/rebalance/tax-optimal (W4.1).
+
+    `target_weights` must sum to ~1.0 (the rebalancer enforces ±1%). All
+    other fields default to safe values; `harvest_losses` is opt-in because
+    surfacing harvest candidates does an extra walk over the lot ledger.
+
+    `lots_override` (optional): caller-supplied per-lot ledger keyed by
+    symbol. When present, the symbol's lots replace the UNKNOWN-date
+    fallback that Kite's `holdings()` forces. Per-symbol lot quantities
+    must reconcile with the live Kite holding quantity (±0.0001) — the
+    rebalancer falls back to UNKNOWN single-lot with a warning otherwise.
+    """
+    target_weights: Dict[str, float]
+    ltcg_used_inr: float = 0.0
+    new_symbol_prices: Optional[Dict[str, float]] = None
+    harvest_losses: bool = False
+    harvest_min_loss_inr: float = 1_000.0
+    harvest_min_loss_pct: float = 5.0
+    as_of: Optional[str] = None  # ISO date YYYY-MM-DD; defaults to today
+    lots_override: Optional[Dict[str, List[LotPayload]]] = None
+
+
+@app.post("/api/portfolio/rebalance/tax-optimal")
+async def rebalance_tax_optimal(req: TaxRebalanceRequest):
+    """Tax-aware rebalance suggestion (W4.1).
+
+    Returns a flat envelope with TAX_MIN trades, FIFO-naive comparison,
+    `savings_inr` / `savings_pct`, tracking error, optional harvest
+    candidates, and warnings (e.g. when Kite holdings lack per-lot
+    acquisition dates and the engine falls back to STCG worst-case).
+
+    Always returns 200 — Kite-disconnected and parse errors surface in the
+    `authenticated` / `error` fields like the rest of the portfolio cluster.
+    """
+    as_of_date: Optional[date] = None
+    if req.as_of:
+        try:
+            as_of_date = datetime.strptime(req.as_of, "%Y-%m-%d").date()
+        except ValueError:
+            return JSONResponse(
+                _sanitize({
+                    'authenticated': controller.kite.is_connected,
+                    'error': f"as_of must be YYYY-MM-DD, got {req.as_of!r}",
+                    'trades': [], 'realized_gains': [],
+                    'tax_summary': {}, 'naive_tax_summary': {},
+                    'savings_inr': 0.0, 'savings_pct': 0.0,
+                    'tracking_error_pct': 0.0,
+                    'harvest_candidates': [], 'warnings': [],
+                }),
+                status_code=400,
+            )
+
+    # Convert Pydantic LotPayload list → plain dicts for the controller; it
+    # parses dates and constructs TaxLot internally so the controller can be
+    # called from non-HTTP paths too.
+    lots_override_raw: Optional[Dict[str, List[Dict]]] = None
+    if req.lots_override is not None:
+        lots_override_raw = {
+            sym: [lot.model_dump() for lot in lots]
+            for sym, lots in req.lots_override.items()
+        }
+
+    result = await _run(
+        controller.recommend_tax_optimal_rebalance,
+        req.target_weights,
+        req.ltcg_used_inr,
+        req.new_symbol_prices,
+        req.harvest_losses,
+        req.harvest_min_loss_inr,
+        req.harvest_min_loss_pct,
+        as_of_date,
+        lots_override_raw,
+    )
+    return JSONResponse(_sanitize(result))
+
+
 @app.get("/api/portfolio/equity-curve")
 async def equity_curve():
     """Generate portfolio equity curve from holdings history."""
@@ -1159,6 +1249,74 @@ async def place_order(req: OrderRequest):
 async def cancel_order(order_id: str):
     result = await _run(controller.cancel_order, order_id)
     return JSONResponse({'cancelled': result is not None})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# COMPLIANCE (W5.3) — SEBI pre-trade gate + post-trade audit log
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class PretradeRequest(BaseModel):
+    """Body schema for POST /api/compliance/pretrade-check (W5.3).
+
+    Runs the SEBI insider-window + concentration gate against the proposed
+    trade. Always returns 200 with a flat envelope; connectivity failures
+    surface in the `authenticated` / `error` fields, matching the rest of
+    the post-Section-1 envelope contract.
+    """
+    symbol: str
+    transaction_type: str  # BUY or SELL
+    quantity: float
+    price: float
+
+
+class DesignatedSymbolsRequest(BaseModel):
+    """Body schema for POST /api/compliance/designated-symbols (W5.3).
+
+    Replaces the user-maintained list of designated-person symbols. Insider
+    trading window enforcement only fires for symbols on this list; an empty
+    list is the safe default (no insider checks).
+    """
+    symbols: List[str]
+
+
+@app.post("/api/compliance/pretrade-check")
+async def compliance_pretrade_check(req: PretradeRequest):
+    """Pre-trade compliance gate. Returns ALLOW / WARN / BLOCK with reasons."""
+    result = await _run(
+        controller.compliance_pretrade_check,
+        req.symbol, req.transaction_type, req.quantity, req.price,
+    )
+    return JSONResponse(_sanitize(result))
+
+
+@app.get("/api/compliance/audit-log")
+async def compliance_audit_log(
+    symbol: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = 100,
+):
+    """Return audit-log entries (newest-first). Filter by symbol/since/limit."""
+    result = await _run(
+        controller.compliance_get_audit_log, symbol, since, limit
+    )
+    return JSONResponse(_sanitize(result))
+
+
+@app.get("/api/compliance/insider-window/{symbol}")
+async def compliance_insider_window(symbol: str):
+    """Return SEBI insider-window status for a symbol (regardless of designation)."""
+    result = await _run(controller.compliance_get_insider_window, symbol)
+    return JSONResponse(_sanitize(result))
+
+
+@app.post("/api/compliance/designated-symbols")
+async def compliance_designated_symbols(req: DesignatedSymbolsRequest):
+    """Replace the designated-person symbol list."""
+    result = await _run(
+        controller.compliance_set_designated_symbols, req.symbols
+    )
+    return JSONResponse(_sanitize(result))
 
 
 # ═════════════════════════════════════════════════════════════════════════════

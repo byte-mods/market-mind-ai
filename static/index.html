@@ -1307,6 +1307,8 @@ h3{
     <button onclick="loadPortfolio()">↻ Refresh</button>
   </div>
 
+  <div id="pf-error" style="display:none;padding:10px 14px;margin-bottom:12px;border-radius:8px;background:rgba(220,80,80,0.12);border:1px solid rgba(220,80,80,0.4);color:#f3a8a8;font-size:13px;line-height:1.5;"></div>
+
   <div class="grid4" style="margin-bottom:14px;">
     <div class="metric-card"><div class="label">Total Value</div><div class="value" id="pf-value">—</div></div>
     <div class="metric-card"><div class="label">Invested</div><div class="value" id="pf-invested">—</div></div>
@@ -5487,6 +5489,16 @@ async function loadPortfolio() {
       API.get('/portfolio/equity-curve'),
       API.get('/portfolio/positions').catch(() => ({ authenticated: false })),
     ]);
+    // Show backend error inline so empty list isn't ambiguous
+    const errEl = document.getElementById('pf-error');
+    if (errEl) {
+      if (summary && summary.error) {
+        errEl.textContent = '⚠ ' + summary.error;
+        errEl.style.display = 'block';
+      } else {
+        errEl.style.display = 'none';
+      }
+    }
     renderPortfolioSummary(summary);
     renderEquityCurve(curve);
     renderHoldings(summary.holdings || []);

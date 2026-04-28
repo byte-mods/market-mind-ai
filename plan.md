@@ -156,16 +156,18 @@ Move from chain display → strategy assembly.
 
 ## Wave 4 — Indian moat (2–3 weeks)
 
-### W4.1. Tax-aware rebalancer ⏳ M
+### W4.1. Tax-aware rebalancer ✅ M
 Optimise rebalance to minimise India-specific tax drag.
 
-- **Indian tax regime (FY26):** STCG 15% (≤1y), LTCG 12.5% above ₹1.25L exemption (>1y).
-- Read holdings + cost basis + acquisition dates from Kite.
-- Solver: minimise `(realized_gain × tax_rate) + tracking_error_to_target`.
-- Suggest tax-loss harvesting against current realized gains.
-- **API:** `POST /api/portfolio/rebalance/tax-optimal` → `{trades:[...], tax_saved_inr, tracking_error}`.
-- **Acceptance:** in a worked test case beats naive rebalance by ≥3% on after-tax return.
-- **Why:** completely undifferentiated by US tools; uniquely valuable here.
+- **Indian tax regime (FY26):** STCG 15% (≤1y), LTCG 12.5% above ₹1.25L exemption (>1y) — encoded in `marketmind/analysis/tax_engine.py`.
+- **Lot-selection strategies** (`tax_lots.py`): FIFO / LIFO / HIFO / TAX_MIN. TAX_MIN realises losses first → LTCG (12.5%) → STCG (15%); ties broken by higher cost-basis.
+- **Rebalancer** (`tax_rebalancer.py`): `recommend_tax_optimal_rebalance(holdings, target_weights, ...)` → `RebalanceRecommendation{trades, tax_summary, naive_tax_summary, savings_inr, savings_pct, tracking_error_pct, harvest_candidates, warnings}`. Self-financing (no cash injection). Naive baseline = FIFO; smart = TAX_MIN.
+- **Tax-loss harvesting:** opt-in via `harvest_losses=True`; thresholds (`min_loss_inr`, `min_loss_pct`) configurable.
+- **Kite integration limitation:** `get_holdings()` does not expose per-lot acquisition dates → fallback to single UNKNOWN-date lot bucketed STCG-worst-case (15%); warning surfaced in response.
+- **API:** `POST /api/portfolio/rebalance/tax-optimal` (server.py) — flat envelope with `authenticated` / `error` fields matching the rest of the portfolio cluster; 200 on connectivity / parse failures, 400 only on malformed `as_of` (Pydantic 422 on body shape).
+- **Acceptance test:** `test_w41_acceptance_tax_aware_beats_naive_by_at_least_3_percent` — 5-symbol scenario with mixed STCG-loss / LTCG-gain lots → smart plan saves ₹38,625 (90.5%) vs naive on the test fixture; bar in plan is ≥3%.
+- **Tests:** 102 (94 pre-existing pure-core + 4 controller envelope + 8 API wire-shape) — full suite 308 green.
+- **Limitations / deferred:** `lots_override` payload (CSV-supplied per-lot dates) for users with their own ledgers; UI deferred (frontend wave); §70/§71 cross-bucket loss set-off and carry-forward intentionally simplified to "clamp negative bucket to zero" (conservative, never under-states tax).
 
 ### W4.2. Multi-asset panel ⏳ M
 Beyond NSE equities.
@@ -190,11 +192,17 @@ Nodes: Repo rate, USD/INR, crude oil, FII flows, GDP growth, sector indices. Lea
 - Black-Litterman lets users inject *views* ("I think TCS will outperform sector by 3%") and blend with market priors.
 - Replace mean-variance default in optimiser.
 
-### W5.3. SEBI compliance layer ⏳ M
-- Insider trading window enforcement (closed periods around results — block self-trades on tracked tickers).
-- Position limits per stock (Kite enforces but UI should warn pre-trade).
-- Algo PDA: pre-trade self-checks + post-trade audit log per SEBI regulation.
-- **Why:** anyone running this for a fund needs this. Cheap insurance.
+### W5.3. SEBI compliance layer ✅ M
+SEBI-aware pre-trade gate + tamper-evident audit log; integrated into `place_order` so every BUY/SELL — successful or Kite-rejected — gets one row.
+
+- **Insider window** (`marketmind/compliance/insider_window.py`): pure compute over pre-fetched NSE announcements. Window CLOSED from most-recent quarter-end (Mar/Jun/Sep/Dec) through `last_results_date + 2 days` (inclusive). SEBI Reg 9(B) approximation. `compute_insider_window(symbol, announcements, today)` returns `InsiderWindowStatus{is_closed, reason, last_results_date, quarter_end}`.
+- **Position limits** (`position_limits.py`): concentration-only this section. `check_position_limits` enforces post-trade concentration warning at >25% of portfolio value AND over-sell error (`qty > current_holding`). Returns frozen `PositionLimitStatus(ok, warnings, errors)`.
+- **Pre-trade gate** (`pretrade_check.py`): `PretradeChecker.check(symbol, side, qty, price, holdings, designated_symbols, announcements, today)` → `PretradeDecision{decision: ALLOW|WARN|BLOCK, reasons, audit_id, insider_blocked: bool}`. Decision logic uses STRUCTURED `insider_blocked` (not substring-match against reason text — caught by super-qa T3 R1).
+- **Audit log** (`audit_log.py`): Mongo-backed `compliance_audit_log` collection, **no TTL** (regulatory). Indexes on `symbol` + `ts`. `_id = "{SYMBOL}:{ts.isoformat()}:{secrets.token_hex(3)}"` — collision-safe under same-microsecond concurrent appends. `MAX_QUERY_LIMIT` cap on read.
+- **AppController integration** (`marketmind/app_controller.py`): 5 new methods (`compliance_pretrade_check`, `compliance_get_audit_log`, `compliance_get_insider_window`, `compliance_set_designated_symbols`, internal `_compliance_record_order_attempt`). `place_order` wraps `kite.place_order(...)` in try/except; exception path writes BLOCK audit row, returns None instead of raising. Designated-symbols cache returns a `set(...)` copy (caller-mutation safe).
+- **API:** 4 routes in `server.py:1283–1317` — `POST /api/compliance/pretrade-check`, `GET /api/compliance/audit-log`, `GET /api/compliance/insider-window/{symbol}`, `POST /api/compliance/designated-symbols`. All use the post-Section-1 envelope contract `{authenticated, error, ...}`. Pydantic models `PretradeRequest`, `DesignatedSymbolsRequest` at module scope.
+- **Tests:** 95 new (5 unit suites + controller integration + mirror API + real-server API), full suite 417 green. Per-task super-qa PASS for all 5 tasks; section-level super-qa PASS verifies POST pretrade-check → AppController → AuditLogStore → GET audit-log round-trip.
+- **Limitations / deferred:** `_id` field of audit rows still leaks through `GET /api/compliance/audit-log` payload (super-qa MINOR — strip when convenient). `today` defaults to UTC date in pretrade_check + insider_window (Indian-market system → IST conversion deferred). `compliance_get_insider_window` unconditionally hits NSE on every call (no designated-symbol gate per docstring; rate-limit at route layer if abused). SPAN/concentration cross-asset limits deferred to W4.2 multi-asset wave.
 
 ---
 
@@ -231,11 +239,11 @@ Time to "noticeably more intelligent": end of Wave 1 (~10 days). Time to "instit
 | W3.1 | Forecasting models | – | ✅ | 2026-04-27 | 2026-04-27 | – |
 | W3.2 | Conformal stacking | – | ✅ | 2026-04-27 | 2026-04-27 | – |
 | W3.3 | Options strategies | – | ✅ | 2026-04-27 | 2026-04-27 | – |
-| W4.1 | Tax rebalancer | – | ⏳ | – | – | – |
+| W4.1 | Tax rebalancer | – | ✅ | 2026-04-28 | 2026-04-28 | – |
 | W4.2 | Multi-asset | – | ⏳ | – | – | – |
 | W5.1 | Causal Bayes net | – | ⏳ | – | – | – |
 | W5.2 | HRP + B-L | – | ⏳ | – | – | – |
-| W5.3 | SEBI compliance | – | ⏳ | – | – | – |
+| W5.3 | SEBI compliance | – | ✅ | 2026-04-28 | 2026-04-28 | – |
 
 ---
 

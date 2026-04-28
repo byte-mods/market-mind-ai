@@ -11,7 +11,7 @@ import threading
 import time
 import logging
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -502,14 +502,40 @@ class KiteClient:
         Get long-term portfolio holdings (equity delivery positions).
         Returns list with: tradingsymbol, exchange, quantity, average_price,
         last_price, pnl, day_change, day_change_percentage, product, etc.
+
+        Silent-failure variant — returns [] on any error. Prefer
+        ``get_holdings_with_diagnostic()`` when the caller needs to surface
+        a token-expiry / connectivity failure to the UI.
+        """
+        holdings, _ = self.get_holdings_with_diagnostic()
+        return holdings
+
+    def get_holdings_with_diagnostic(self) -> Tuple[List[Dict], Optional[str]]:
+        """
+        Like ``get_holdings()`` but returns ``(holdings, error_message)``.
+
+        ``error_message`` is None on success or a short, user-facing string
+        describing the failure (token expired, network, client uninitialised).
+        TokenException — the daily access-token expiry — is recognised and
+        translated into an actionable "please re-login" message.
         """
         if not self.kite:
-            return []
+            return [], (
+                "Kite client not initialised — check api_key / access_token "
+                "in local.json or restart the server."
+            )
         try:
-            return self.kite.holdings()
+            return self.kite.holdings(), None
         except Exception as e:
-            logger.error(f"Holdings error: {e}")
-            return []
+            cls_name = type(e).__name__
+            msg = str(e) or repr(e)
+            logger.error(f"Holdings error: {cls_name}: {msg}")
+            if "Token" in cls_name or "token" in msg.lower():
+                return [], (
+                    "Kite access token expired or invalid — please re-login "
+                    "(Kite tokens auto-revoke at the daily session boundary)."
+                )
+            return [], f"{cls_name}: {msg}"
 
     def get_positions(self) -> Dict:
         """

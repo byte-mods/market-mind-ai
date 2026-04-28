@@ -21,6 +21,22 @@ from .core.claude_news_fetcher import run_claude_news_pipeline, get_recent_news_
 from .ml.rl_agent import RLDecisionEngine, DQNTradingAgent
 from .ml.trading_env import TradingEnvironment
 from .analysis.portfolio_simulator import PortfolioSimulator
+from .analysis.tax_rebalancer import (
+    CurrentHolding,
+    recommend_tax_optimal_rebalance as _recommend_tax_optimal_rebalance,
+)
+from .analysis.tax_lots import TaxLot
+from .compliance.audit_log import (
+    DECISION_ALLOW,
+    DECISION_BLOCK,
+    SOURCE_ORDER_ATTEMPT,
+    AuditLogEntry,
+    AuditLogStore,
+)
+from .compliance.insider_window import compute_insider_window
+from .compliance.pretrade_check import PretradeChecker
+from dataclasses import asdict
+from datetime import date, datetime, timezone
 
 try:
     import pymongo
@@ -54,6 +70,19 @@ class AppController:
         self._mongo_client = None
         self._mongo_db = None
         self._init_mongo()
+
+        # SEBI compliance layer (W5.3) — must be constructed AFTER _init_mongo
+        # so the audit-log + designated-symbols collections are reachable.
+        # Designated-symbols cache lives here; invalidated on
+        # `compliance_set_designated_symbols`.
+        self._compliance_designated_cache: Optional[set] = None
+        self._compliance_audit_store = AuditLogStore(
+            mongo_col=self._mongo_col("compliance_audit_log")
+        )
+        self.compliance = PretradeChecker(
+            audit_log=self._compliance_audit_store,
+            designated_symbols_provider=self._compliance_designated_symbols,
+        )
 
         # Kite Connect
         self.kite_config = KiteConfig()
@@ -645,17 +674,32 @@ class AppController:
         return self.kite.get_available_cash()
 
     def get_portfolio_summary(self) -> Dict:
-        """Compute portfolio summary from holdings"""
-        holdings = self.get_holdings()
-        if not holdings:
+        """Compute portfolio summary from holdings.
+
+        Always returns ``authenticated`` (kite connection state) and ``error``
+        (None on success, user-facing string on failure) so the frontend can
+        distinguish "no holdings" from "fetch failed".
+        """
+        empty = {
+            'total_value': 0,
+            'invested': 0,
+            'pnl': 0,
+            'pnl_pct': 0,
+            'day_change': 0,
+            'holdings': [],
+        }
+        if not self.kite.is_connected:
             return {
-                'total_value': 0,
-                'invested': 0,
-                'pnl': 0,
-                'pnl_pct': 0,
-                'day_change': 0,
-                'holdings': [],
+                **empty,
+                'authenticated': False,
+                'error': 'Kite not connected. Click Login to authenticate.',
             }
+
+        holdings, err = self.kite.get_holdings_with_diagnostic()
+        if err is not None:
+            return {**empty, 'authenticated': True, 'error': err}
+        if not holdings:
+            return {**empty, 'authenticated': True, 'error': None}
 
         total_value = sum(h.get('last_price', 0) * h.get('quantity', 0) for h in holdings)
         invested = sum(h.get('average_price', 0) * h.get('quantity', 0) for h in holdings)
@@ -673,6 +717,373 @@ class AppController:
             'pnl_pct': pnl_pct,
             'day_change': day_change,
             'holdings': holdings,
+            'authenticated': True,
+            'error': None,
+        }
+
+    def recommend_tax_optimal_rebalance(
+        self,
+        target_weights: Dict[str, float],
+        ltcg_used_inr: float = 0.0,
+        new_symbol_prices: Optional[Dict[str, float]] = None,
+        harvest_losses: bool = False,
+        harvest_min_loss_inr: float = 1_000.0,
+        harvest_min_loss_pct: float = 5.0,
+        as_of: Optional[date] = None,
+        lots_override: Optional[Dict[str, List[Dict]]] = None,
+    ) -> Dict:
+        """Build a tax-aware rebalance recommendation (W4.1).
+
+        Wraps :func:`marketmind.analysis.tax_rebalancer.recommend_tax_optimal_rebalance`
+        with Kite holdings fetch and the same ``authenticated`` / ``error``
+        envelope used by :meth:`get_portfolio_summary`. Returns a flat dict
+        ready for JSON serialisation.
+
+        Lot-level acquisition dates are NOT available from Kite's ``holdings()``
+        endpoint — every position is materialised as a single UNKNOWN-date lot,
+        which the tax engine buckets as STCG worst-case (15%). The rebalancer
+        surfaces this in the response ``warnings`` list.
+
+        ``lots_override`` (optional, keyed by symbol) lets callers with their
+        own lot ledger (broker-statement CSV, etc.) bypass the UNKNOWN
+        fallback. Each lot dict needs ``quantity`` (float), ``cost_basis``
+        (float), and optional ``acquisition_date`` (ISO YYYY-MM-DD or None).
+        Per-symbol lot quantities must reconcile with the live Kite holding
+        quantity within ±0.0001 — the rebalancer falls back to UNKNOWN
+        single-lot with a warning otherwise.
+        """
+        empty: Dict = {
+            'trades': [],
+            'realized_gains': [],
+            'tax_summary': {},
+            'naive_tax_summary': {},
+            'savings_inr': 0.0,
+            'savings_pct': 0.0,
+            'tracking_error_pct': 0.0,
+            'harvest_candidates': [],
+            'warnings': [],
+        }
+
+        if not self.kite.is_connected:
+            return {
+                **empty,
+                'authenticated': False,
+                'error': 'Kite not connected. Click Login to authenticate.',
+            }
+
+        holdings_raw, err = self.kite.get_holdings_with_diagnostic()
+        if err is not None:
+            return {**empty, 'authenticated': True, 'error': err}
+
+        # Surface malformed Kite rows (missing tradingsymbol) as warnings instead
+        # of silently dropping them — caller needs to know Kite returned junk.
+        # Capped at 5 individual lines + 1 summary so a degenerate Kite response
+        # cannot blow up the warnings payload.
+        prelim_warnings: List[str] = []
+        malformed_count = 0
+        for idx, h in enumerate(holdings_raw):
+            if not h.get('tradingsymbol'):
+                malformed_count += 1
+                if malformed_count <= 5:
+                    prelim_warnings.append(
+                        f"skipped Kite holdings row {idx}: missing tradingsymbol"
+                    )
+        if malformed_count > 5:
+            prelim_warnings.append(
+                f"... and {malformed_count - 5} more malformed Kite rows skipped"
+            )
+
+        # Materialise caller-supplied lot ledger (if any) into TaxLot lists
+        # keyed by symbol. Bad date strings surface as a warning + fallback
+        # to UNKNOWN for that symbol — never as a 5xx.
+        lots_by_symbol: Dict[str, Optional[List[TaxLot]]] = {}
+        if lots_override:
+            for sym, lot_dicts in lots_override.items():
+                try:
+                    lots_by_symbol[sym] = [
+                        TaxLot(
+                            symbol=sym,
+                            quantity=float(d.get('quantity', 0) or 0),
+                            cost_basis=float(d.get('cost_basis', 0) or 0),
+                            acquisition_date=(
+                                datetime.strptime(d['acquisition_date'], '%Y-%m-%d').date()
+                                if d.get('acquisition_date') else None
+                            ),
+                        )
+                        for d in lot_dicts
+                    ]
+                except (ValueError, TypeError, KeyError) as e:
+                    prelim_warnings.append(
+                        f"{sym}: lots_override parse error "
+                        f"({type(e).__name__}: {e}); falling back to UNKNOWN"
+                    )
+                    lots_by_symbol[sym] = None
+
+        try:
+            current = [
+                CurrentHolding(
+                    symbol=h.get('tradingsymbol', ''),
+                    quantity=float(h.get('quantity', 0) or 0),
+                    last_price=float(h.get('last_price', 0) or 0),
+                    avg_cost=float(h.get('average_price', 0) or 0),
+                    lots=lots_by_symbol.get(h.get('tradingsymbol', '')),
+                )
+                for h in holdings_raw
+                if h.get('tradingsymbol')
+            ]
+        except (ValueError, TypeError) as e:
+            return {**empty, 'authenticated': True,
+                    'error': f"holdings parse error: {type(e).__name__}: {e}"}
+
+        try:
+            rec = _recommend_tax_optimal_rebalance(
+                holdings=current,
+                target_weights=target_weights,
+                as_of=as_of or date.today(),
+                ltcg_used_inr=ltcg_used_inr,
+                new_symbol_prices=new_symbol_prices,
+                harvest_losses=harvest_losses,
+                harvest_min_loss_inr=harvest_min_loss_inr,
+                harvest_min_loss_pct=harvest_min_loss_pct,
+            )
+        except ValueError as e:
+            return {**empty, 'authenticated': True, 'error': str(e)}
+
+        return {
+            'trades': [asdict(t) for t in rec.trades],
+            'realized_gains': [asdict(g) for g in rec.realized_gains],
+            'tax_summary': dict(rec.tax_summary),
+            'naive_tax_summary': dict(rec.naive_tax_summary),
+            'savings_inr': rec.savings_inr,
+            'savings_pct': rec.savings_pct,
+            'tracking_error_pct': rec.tracking_error_pct,
+            'harvest_candidates': [asdict(c) for c in rec.harvest_candidates],
+            'warnings': prelim_warnings + list(rec.warnings),
+            'authenticated': True,
+            'error': None,
+        }
+
+    # ----------------------------------------------------------
+    # SEBI COMPLIANCE (W5.3)
+    # ----------------------------------------------------------
+
+    def _compliance_designated_symbols(self) -> set:
+        """Return the user-maintained designated-persons symbol set.
+
+        Cached in-memory; invalidated by ``compliance_set_designated_symbols``.
+        Returns an empty set when Mongo is unavailable — pretrade_check then
+        skips the insider-window check for every symbol (safe-by-default).
+
+        Returns a fresh copy each call so callers cannot mutate the cache
+        through the returned reference.
+        """
+        if self._compliance_designated_cache is not None:
+            return set(self._compliance_designated_cache)
+        col = self._mongo_col("compliance_designated")
+        if col is None:
+            self._compliance_designated_cache = set()
+            return set()
+        try:
+            doc = col.find_one({"_id": "symbols"})
+        except Exception as e:
+            logger.warning(f"compliance_designated load failed: {e}")
+            self._compliance_designated_cache = set()
+            return set()
+        if not doc:
+            self._compliance_designated_cache = set()
+        else:
+            self._compliance_designated_cache = {
+                s.upper().strip() for s in (doc.get("symbols") or [])
+                if isinstance(s, str) and s.strip()
+            }
+        return set(self._compliance_designated_cache)
+
+    def _compliance_record_order_attempt(
+        self, *, symbol, transaction_type, quantity, price, decision, reasons,
+    ) -> None:
+        """Best-effort audit append from place_order. Never raises."""
+        try:
+            entry = AuditLogEntry(
+                ts=datetime.now(timezone.utc),
+                symbol=str(symbol or "?").upper(),
+                transaction_type=str(transaction_type or "?").upper(),
+                quantity=float(quantity or 0),
+                price=float(price or 0),
+                decision=decision,
+                reasons=list(reasons),
+                source=SOURCE_ORDER_ATTEMPT,
+            )
+            self._compliance_audit_store.append(entry)
+        except Exception as e:
+            logger.warning(f"order_attempt audit failed: {e}")
+
+    def compliance_pretrade_check(
+        self,
+        symbol: str,
+        transaction_type: str,
+        quantity: float,
+        price: float,
+    ) -> Dict:
+        """Run the SEBI pre-trade gate. Always returns the standard envelope."""
+        sym_norm = (symbol or "").upper().strip()
+        if not sym_norm:
+            return {
+                'authenticated': self.kite_is_authenticated,
+                'error': "symbol must be non-empty",
+                'decision': 'BLOCK',
+                'reasons': ["symbol must be non-empty"],
+                'audit_id': None,
+                'insider_window_open': None,
+                'insider_window_reason': None,
+                'ts': None,
+            }
+        # Only fetch announcements for designated symbols — saves the NSE round-trip.
+        designated = self._compliance_designated_symbols()
+        announcements: List[Dict] = []
+        if sym_norm in designated:
+            try:
+                from marketmind.core.filings_ingest import get_filings_ingester
+                announcements = get_filings_ingester().fetch_announcements(sym_norm)
+            except Exception as e:
+                logger.warning(f"announcement fetch failed for {sym_norm}: {e}")
+        holdings: List[Dict] = []
+        if self.kite_is_authenticated:
+            try:
+                holdings = self.kite.get_holdings() or []
+            except Exception as e:
+                logger.warning(f"holdings fetch failed: {e}")
+        decision = self.compliance.check(
+            symbol=sym_norm,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            price=price,
+            announcements=announcements,
+            holdings=holdings,
+        )
+        return {
+            'authenticated': self.kite_is_authenticated,
+            'error': None,
+            **decision.to_dict(),
+        }
+
+    def compliance_get_audit_log(
+        self,
+        symbol: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: int = 100,
+    ) -> Dict:
+        """Return audit-log entries newest-first with envelope."""
+        parsed_since: Optional[datetime] = None
+        if since:
+            try:
+                parsed_since = datetime.fromisoformat(since)
+                if parsed_since.tzinfo is None:
+                    parsed_since = parsed_since.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return {
+                    'authenticated': self.kite_is_authenticated,
+                    'error': f"since must be ISO datetime, got {since!r}",
+                    'entries': [],
+                }
+        try:
+            rows = self._compliance_audit_store.query(
+                symbol=symbol, since=parsed_since, limit=limit
+            )
+        except Exception as e:
+            return {
+                'authenticated': self.kite_is_authenticated,
+                'error': f"audit log query failed: {type(e).__name__}: {e}",
+                'entries': [],
+            }
+        entries = []
+        for r in rows:
+            e = dict(r)
+            # Strip Mongo-internal `_id` — it is a write-collision-safe key
+            # (symbol:ts:rand6) and not part of the regulatory audit contract.
+            # Callers reference rows by `audit_id` from the pretrade response.
+            e.pop('_id', None)
+            ts = e.get('ts')
+            if isinstance(ts, datetime):
+                e['ts'] = ts.isoformat()
+            entries.append(e)
+        return {
+            'authenticated': self.kite_is_authenticated,
+            'error': None,
+            'entries': entries,
+        }
+
+    def compliance_get_insider_window(self, symbol: str) -> Dict:
+        """Compute insider-window status for a symbol (regardless of designation)."""
+        sym_norm = (symbol or "").upper().strip()
+        if not sym_norm:
+            return {
+                'authenticated': self.kite_is_authenticated,
+                'error': "symbol must be non-empty",
+                'symbol': '',
+                'is_open': None,
+                'closed_until': None,
+                'last_results_date': None,
+                'reason': '',
+            }
+        announcements: List[Dict] = []
+        fetch_err: Optional[str] = None
+        try:
+            from marketmind.core.filings_ingest import get_filings_ingester
+            announcements = get_filings_ingester().fetch_announcements(sym_norm)
+        except Exception as e:
+            fetch_err = f"announcement fetch failed: {type(e).__name__}: {e}"
+        today = datetime.now(timezone.utc).date()
+        status = compute_insider_window(sym_norm, announcements, today)
+        return {
+            'authenticated': self.kite_is_authenticated,
+            'error': fetch_err,
+            'symbol': status.symbol,
+            'is_open': status.is_open,
+            'closed_until': status.closed_until.isoformat() if status.closed_until else None,
+            'last_results_date': (
+                status.last_results_date.isoformat() if status.last_results_date else None
+            ),
+            'reason': status.reason,
+        }
+
+    def compliance_set_designated_symbols(self, symbols: List[str]) -> Dict:
+        """Replace the designated-symbols list. Persists to Mongo + invalidates cache."""
+        cleaned = [
+            s.upper().strip() for s in (symbols or [])
+            if isinstance(s, str) and s.strip()
+        ]
+        # Dedupe preserving order.
+        seen: set = set()
+        deduped: List[str] = []
+        for s in cleaned:
+            if s not in seen:
+                seen.add(s)
+                deduped.append(s)
+        col = self._mongo_col("compliance_designated")
+        if col is None:
+            self._compliance_designated_cache = set(deduped)
+            return {
+                'authenticated': self.kite_is_authenticated,
+                'error': "mongo not available; designated list not persisted",
+                'symbols': deduped,
+            }
+        try:
+            col.replace_one(
+                {"_id": "symbols"},
+                {"_id": "symbols", "symbols": deduped},
+                upsert=True,
+            )
+        except Exception as e:
+            return {
+                'authenticated': self.kite_is_authenticated,
+                'error': f"failed to persist: {type(e).__name__}: {e}",
+                'symbols': deduped,
+            }
+        self._compliance_designated_cache = set(deduped)
+        return {
+            'authenticated': self.kite_is_authenticated,
+            'error': None,
+            'symbols': deduped,
         }
 
     # ----------------------------------------------------------
@@ -707,25 +1118,56 @@ class AppController:
         variety: str = 'regular',
         tag: str = 'marketmind',
     ) -> Optional[str]:
-        """Place an order via Kite"""
-        if not self.kite.is_connected:
-            logger.warning("Kite not authenticated — cannot place order")
-            return None
-        return self.kite.place_order(
-            tradingsymbol=tradingsymbol,
-            exchange=exchange,
+        """Place an order via Kite. Writes one compliance-audit row per call
+        (source=order_attempt) — covers SEBI Algo PDA post-trade audit."""
+        audit_kwargs = dict(
+            symbol=tradingsymbol,
             transaction_type=transaction_type,
             quantity=quantity,
-            order_type=order_type,
-            product=product,
             price=price,
-            trigger_price=trigger_price,
-            stoploss=stoploss,
-            squareoff=squareoff,
-            trailing_stoploss=trailing_stoploss,
-            variety=variety,
-            tag=tag,
         )
+        if not self.kite.is_connected:
+            logger.warning("Kite not authenticated — cannot place order")
+            self._compliance_record_order_attempt(
+                decision=DECISION_BLOCK,
+                reasons=["kite not authenticated"],
+                **audit_kwargs,
+            )
+            return None
+        # Audit on EVERY attempt — including the rare case where KiteClient
+        # leaks an exception out of its internal try/except. Catching here
+        # (rather than relying on KiteClient's wrapper) keeps the
+        # regulatory-audit guarantee intact under future KiteClient changes.
+        try:
+            order_id = self.kite.place_order(
+                tradingsymbol=tradingsymbol,
+                exchange=exchange,
+                transaction_type=transaction_type,
+                quantity=quantity,
+                order_type=order_type,
+                product=product,
+                price=price,
+                trigger_price=trigger_price,
+                stoploss=stoploss,
+                squareoff=squareoff,
+                trailing_stoploss=trailing_stoploss,
+                variety=variety,
+                tag=tag,
+            )
+        except Exception as e:
+            logger.error(f"Order placement raised: {e}")
+            self._compliance_record_order_attempt(
+                decision=DECISION_BLOCK,
+                reasons=[f"kite raised: {type(e).__name__}: {e}"],
+                **audit_kwargs,
+            )
+            return None
+        self._compliance_record_order_attempt(
+            decision=DECISION_ALLOW if order_id else DECISION_BLOCK,
+            reasons=[f"order placed: {order_id}"] if order_id else ["kite rejected order"],
+            **audit_kwargs,
+        )
+        return order_id
 
     def cancel_order(self, order_id: str, variety: str = 'regular') -> Optional[str]:
         return self.kite.cancel_order(order_id, variety) if self.kite.is_connected else None
