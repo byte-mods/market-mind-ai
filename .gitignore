@@ -107,3 +107,4 @@ _legacy/
 node_modules/
 .next/
 .turbo/
+.lens/

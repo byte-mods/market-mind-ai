@@ -53,7 +53,7 @@ class PortfolioOptimizer:
         sharpe = (ret - self.RISK_FREE_RATE) / vol if vol > 0 else 0
         return ret, vol, sharpe
 
-    def optimize(self, symbols: List[str], objective: str = 'hrp',
+    def optimize(self, symbols: List[str], objective: str = 'max_sharpe',
                  days: int = 252,
                  views: Optional[List[Dict]] = None,
                  market_weights: Optional[Dict[str, float]] = None) -> Dict:
@@ -155,9 +155,9 @@ class PortfolioOptimizer:
         }
 
     def compare_strategies(self, symbols: List[str], days: int = 252) -> List[Dict]:
-        """Compare all strategies side by side."""
+        """Compare all four strategies side by side."""
         results = []
-        for obj in ['equal_weight', 'min_variance', 'risk_parity', 'max_sharpe', 'hrp', 'black_litterman']:
+        for obj in ['equal_weight', 'min_variance', 'risk_parity', 'max_sharpe']:
             r = self.optimize(symbols, objective=obj, days=days)
             if 'error' not in r:
                 results.append({
@@ -272,11 +272,7 @@ class PortfolioOptimizer:
             return np.ones(len(df.columns)) / len(df.columns)
 
     def _get_quasi_diag(self, link):
-        """Sort items by hierarchical clustering distance.
-
-        Unpacks the linkage matrix recursively so that similar assets are
-        placed next to each other in the final ordering. This ordering is
-        the input to recursive bisection."""
+        """Sort items by hierarchical clustering distance."""
         sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
         num_items = link[-1, 3]
         while sort_ix.max() >= num_items:
@@ -292,21 +288,14 @@ class PortfolioOptimizer:
         return sort_ix.tolist()
 
     def _get_cluster_var(self, cov, cluster_items):
-        """Variance of inverse-variance portfolio within cluster.
-
-        Uses the IVP of the cluster slice as a proxy for the cluster's
-        aggregate variance — cheaper than optimizing a sub-portfolio."""
+        """Variance of inverse-variance portfolio within cluster."""
         cov_slice = cov.iloc[cluster_items, cluster_items]
         w_ = 1.0 / np.diag(cov_slice)
         w_ /= w_.sum()
         return float(np.dot(w_, np.dot(cov_slice, w_)))
 
     def _get_recursive_bisection(self, cov, sorted_idx):
-        """Allocate weights recursively by inverse cluster variance.
-
-        At each split, the sub-cluster with lower variance receives more
-        capital (alpha = var_other / (var_left + var_right)). This is the
-        key step that makes HRP robust to noisy covariance estimates."""
+        """Allocate weights recursively by inverse cluster variance."""
         w = pd.Series(1.0, index=sorted_idx)
         clusters = [sorted_idx]
         while len(clusters) > 0:
@@ -319,7 +308,6 @@ class PortfolioOptimizer:
                     var1 = self._get_cluster_var(cov, c1)
                     var2 = self._get_cluster_var(cov, c2)
                     denom = var1 + var2
-                    # Higher-variance cluster gets less weight
                     alpha = var2 / denom if denom > 0 else 0.5
                     w[c1] *= alpha
                     w[c2] *= 1.0 - alpha
@@ -332,11 +320,6 @@ class PortfolioOptimizer:
     def _black_litterman(self, mean_rets, cov, n, valid_syms,
                          views=None, market_weights=None):
         """Simplified Black-Litterman: blend user views with market prior.
-
-        Uses the He & Litterman reference model: uncertainty of each view is
-        proportional to the prior variance of that view (scaled by confidence).
-        All calculations are in daily units to stay consistent with the
-        covariance matrix returned by pandas.DataFrame.cov().
 
         Returns (weights, posterior_daily_total_returns) or (weights, None) on fallback.
         """
@@ -408,7 +391,7 @@ class PortfolioOptimizer:
 
             # Posterior expected returns: Er = Pi + M @ P.T @ inv(P @ M @ P.T + Omega) @ (Q - P @ Pi)
             pmp = np.dot(P, np.dot(M, P.T)) + Omega
-            # Add tiny jitter for numerical stability when views are highly confident
+            # Add tiny jitter for numerical stability
             pmp += np.eye(pmp.shape[0]) * 1e-12
             inv_pmp = np.linalg.inv(pmp)
             rhs = Q - np.dot(P, Pi)
