@@ -132,7 +132,9 @@ def test_kite_fallback_index_mapping() -> None:
             'depth': {'buy': [{'price': 119.5, 'quantity': 100}], 'sell': [{'price': 120.5, 'quantity': 100}]},
         },
     }
-    ltp = {"NSE:NIFTY": {"last_price": 25000.0}}
+    # Kite indices live under their full display name with a space
+    # ("NSE:NIFTY 50"), not the bare F&O code.
+    ltp = {"NSE:NIFTY 50": {"last_price": 25000.0}}
     kite = _StubKite(instruments=insts, quotes=quotes, ltp=ltp)
 
     result = fetcher.get_option_chain_from_kite("NIFTY", kite)

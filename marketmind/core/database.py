@@ -101,8 +101,58 @@ class Database:
             )
         """)
 
+        # User settings — generic JSON-encoded key/value store. Used for
+        # watchlist persistence and any other small UI-owned preferences that
+        # belong in the local DB rather than the secrets-bearing local.json.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         conn.commit()
         conn.close()
+
+    # ── Generic settings KV ────────────────────────────────────────────────
+    def set_setting(self, key: str, value) -> None:
+        """Upsert a JSON-encoded preference. Values are serialised so callers
+        may store lists, dicts, numbers, or strings interchangeably."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, json.dumps(value)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_setting(self, key: str, default=None):
+        """Return the JSON-decoded value for `key`, or `default` if absent or
+        if the stored payload is not valid JSON (forward-compat with manual
+        edits)."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return default
+        try:
+            return json.loads(row[0])
+        except (TypeError, ValueError):
+            return default
 
     def store_news(self, news_item: Dict) -> bool:
         """Store a news item"""

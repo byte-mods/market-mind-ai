@@ -78,25 +78,34 @@ class MacroFetcher:
                 self._session = None
         return None
 
-    def get_usdinr(self) -> Dict:
-        """Get USD/INR rate from NSE currency derivatives."""
+    def get_usdinr(self, kite_client=None) -> Dict:
+        """Get USD/INR rate.
+
+        The legacy ``quote-derivative?symbol=USDINR`` path returned empty
+        ``stocks`` and ``underlyingValue == "-"`` outside CDS hours, leaving
+        the macro card pinned to the 84.5 fallback. We now delegate to
+        :class:`MultiAssetFetcher.get_forex`, which already implements the
+        Kite-CDS-first → NSE-fallback contract used elsewhere in the app and
+        returns a non-zero quote whenever the user is authenticated.
+        """
         cache_key = 'usdinr'
         cached = self._cache.get(cache_key)
         if cached and time.time() - cached['ts'] < self._cache_ttl:
             return cached['data']
         try:
-            data = self._nse_get("quote-derivative?symbol=USDINR")
-            if data:
-                info = data.get('quoteVFO', {}) or {}
-                ltp = float(info.get('lastPrice', 0) or 84.5)
-                prev = float(info.get('prevClose', ltp) or ltp)
+            from marketmind.core.multiasset_fetcher import get_multiasset_fetcher
+            forex = get_multiasset_fetcher().get_forex(kite_client) or {}
+            row = forex.get('usdinr') or {}
+            rate = float(row.get('rate') or 0)
+            if rate:
+                prev = float(row.get('prev') or rate)
                 result = {
                     'symbol': 'USD/INR',
-                    'rate': ltp,
+                    'rate': rate,
                     'prev': prev,
-                    'change': round(ltp - prev, 4),
-                    'change_pct': round((ltp - prev) / prev * 100, 3) if prev else 0,
-                    'source': 'nse',
+                    'change': round(rate - prev, 4),
+                    'change_pct': round((rate - prev) / prev * 100, 3) if prev else 0,
+                    'source': row.get('source', 'multiasset'),
                 }
                 self._cache[cache_key] = {'data': result, 'ts': time.time()}
                 return result
@@ -147,7 +156,10 @@ class MacroFetcher:
                     if idx.get('index') == 'NIFTY 500':
                         pe = float(idx.get('pe', 0) or 22)
                         pb = float(idx.get('pb', 0) or 4)
-                        div = float(idx.get('divYield', 0) or 1.2)
+                        # NSE allIndices field is `dy`, not `divYield`. Keeping
+                        # `divYield` as a forward-compat alias for older fixtures.
+                        div_raw = idx.get('dy') or idx.get('divYield') or 0
+                        div = float(div_raw or 1.2)
                         # Historical average PE ~22, overvalued >25, undervalued <18
                         valuation = ('Overvalued' if pe > 25 else
                                      'Fair Value' if pe > 18 else 'Undervalued')
@@ -223,10 +235,15 @@ class MacroFetcher:
         return {'advances': 1200, 'declines': 800, 'unchanged': 100,
                 'adr': 1.5, 'breadth_pct': 57, 'signal': 'Narrow Rally'}
 
-    def get_all(self) -> Dict:
-        """Fetch all macro indicators at once."""
+    def get_all(self, kite_client=None) -> Dict:
+        """Fetch all macro indicators at once.
+
+        ``kite_client`` is forwarded to :meth:`get_usdinr` so the Kite CDS
+        path is used when the user is authenticated. Pass ``None`` to force
+        the public-NSE fallback (used by tests).
+        """
         return {
-            'usdinr': self.get_usdinr(),
+            'usdinr': self.get_usdinr(kite_client),
             'india_vix': self.get_india_vix(),
             'nifty_pe': self.get_nifty_pe(),
             'rbi_rates': self.get_rbi_rates(),

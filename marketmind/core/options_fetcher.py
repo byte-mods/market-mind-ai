@@ -200,11 +200,23 @@ class OptionsFetcher:
         atm = min(set(i.get('strikePrice', 0) for i in data),
                   key=lambda x: abs(x - underlying)) if data else 0
 
+        # Days-to-expiry for the nearest expiry — advisor uses this for
+        # IV-based price cones and time-decay management rules.
+        dte = 0
+        if expiry_dates:
+            from datetime import date as _date, datetime as _dt
+            try:
+                nearest = _dt.strptime(expiry_dates[0], '%d-%b-%Y').date()
+                dte = max((nearest - _date.today()).days, 0)
+            except Exception:
+                dte = 0
+
         return {
             'symbol': symbol,
             'underlying': underlying,
             'atm_strike': atm,
             'expiry_dates': expiry_dates[:8],
+            'days_to_expiry': dte,
             'calls': calls,
             'puts': puts,
             'total_call_oi': total_call_oi,
@@ -281,15 +293,17 @@ class OptionsFetcher:
 
             near_opts = [inst for inst in opts if inst.get('expiry') == nearest_expiry]
 
-            # 4. Get underlying price
-            exchange = 'NSE'
-            if sym_upper in INDICES:
-                exchange = 'NSE'
-            ltp_resp = kite_client.get_ltp([f"{exchange}:{sym_upper}"])
+            # 4. Get underlying price.
+            # Kite indices live under their full display name with a space
+            # (e.g. "NSE:NIFTY 50"), not the bare F&O code "NIFTY". Using the
+            # bare code returns no quote and leaves underlying at 0, which
+            # cascades into ATM = strikes[0] (way OTM).
+            spot_key = f"NSE:{kite_name}" if sym_upper in INDICES else f"NSE:{sym_upper}"
+            ltp_resp = kite_client.get_ltp([spot_key])
             underlying = 0.0
             if ltp_resp:
                 underlying = float(
-                    (ltp_resp.get(f"{exchange}:{sym_upper}") or {}).get('last_price', 0)
+                    (ltp_resp.get(spot_key) or {}).get('last_price', 0)
                 )
 
             # 5. Determine strikes to fetch — all strikes for nearest expiry
@@ -365,11 +379,40 @@ class OptionsFetcher:
             pcr = round(total_put_oi / total_call_oi, 3) if total_call_oi else 1.0
             atm = min((c['strike'] for c in calls), key=lambda x: abs(x - underlying)) if calls else 0
 
+            # Back-solve IV per strike from BS so the chain isn't IV=0
+            # everywhere. Kite's quote endpoint omits IV; without this the
+            # downstream advisor can't read a vol regime.
+            days_to_exp = max((nearest_expiry - today).days, 0)
+            if underlying > 0 and days_to_exp > 0:
+                from marketmind.ml.options.pricing import implied_vol, days_to_T
+                T = days_to_T(days_to_exp)
+                for c in calls:
+                    iv = implied_vol(c['ltp'], underlying, c['strike'], T, 'CE')
+                    c['iv'] = round(iv * 100.0, 2)  # serve in % to match NSE convention
+                for p in puts:
+                    iv = implied_vol(p['ltp'], underlying, p['strike'], T, 'PE')
+                    p['iv'] = round(iv * 100.0, 2)
+
+            # Max-pain over the strikes we actually have. Building the
+            # NSE-shaped record dict from the call/put arrays so we can reuse
+            # _calc_max_pain instead of duplicating the loss-aggregation loop.
+            mp_records = []
+            calls_by_strike = {c['strike']: c for c in calls}
+            puts_by_strike = {p['strike']: p for p in puts}
+            for strike in sorted(set(calls_by_strike) | set(puts_by_strike)):
+                mp_records.append({
+                    'strikePrice': strike,
+                    'CE': {'openInterest': calls_by_strike.get(strike, {}).get('oi', 0)},
+                    'PE': {'openInterest': puts_by_strike.get(strike, {}).get('oi', 0)},
+                })
+            max_pain = self._calc_max_pain(mp_records) if mp_records else 0.0
+
             return {
                 'symbol': sym_upper,
                 'underlying': underlying,
                 'atm_strike': atm,
                 'expiry_dates': [nearest_expiry.isoformat()],
+                'days_to_expiry': days_to_exp,
                 'calls': calls,
                 'puts': puts,
                 'total_call_oi': total_call_oi,
@@ -377,7 +420,7 @@ class OptionsFetcher:
                 'max_call_oi_strike': max(calls, key=lambda x: x['oi'])['strike'] if calls else 0,
                 'max_put_oi_strike': max(puts, key=lambda x: x['oi'])['strike'] if puts else 0,
                 'pcr': pcr,
-                'max_pain': 0.0,  # Would need full chain for accurate max pain
+                'max_pain': max_pain,
                 'sentiment': 'Bullish' if pcr > 1.2 else ('Bearish' if pcr < 0.7 else 'Neutral'),
                 'timestamp': time.time(),
                 'source': 'kite',

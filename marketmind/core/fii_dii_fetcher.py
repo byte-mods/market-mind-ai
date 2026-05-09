@@ -77,6 +77,14 @@ class FIIDIIFetcher:
             return self._fallback_data()
 
     def _parse_fiidii(self, raw) -> List[Dict]:
+        """Normalise NSE FII/DII payload.
+
+        The current NSE shape is one row per (date, category) pair where
+        ``category`` is ``"FII/FPI"`` or ``"DII"``. We group by date and
+        place values into the right side of the record. The legacy single-row
+        shape (``fiiBuy``/``diiBuy`` on the same row) is still honoured for
+        forward-compat with older NSE API versions and unit-test fixtures.
+        """
         items = []
         if isinstance(raw, list):
             rows = raw
@@ -85,46 +93,70 @@ class FIIDIIFetcher:
         else:
             return self._fallback_data()
 
+        # Group by date — NSE serves one row per category per date.
+        # OrderedDict preserves NSE's emission order for the stable sort below.
+        from collections import OrderedDict
+        by_date: "OrderedDict[str, Dict]" = OrderedDict()
+
         for row in rows:
             try:
-                # NSE returns different field names across API versions
                 date_str = (row.get('date') or row.get('Date') or
                             row.get('tradeDate') or row.get('TRADE_DATE', ''))
-
-                # FII
-                fii_buy = self._to_float(
-                    row.get('fiiBuy') or row.get('fii_buy') or
-                    row.get('BUY_VALUE') or row.get('buyValue', 0))
-                fii_sell = self._to_float(
-                    row.get('fiiSell') or row.get('fii_sell') or
-                    row.get('SELL_VALUE') or row.get('sellValue', 0))
-                fii_net = self._to_float(
-                    row.get('fiiNet') or row.get('fii_net') or
-                    row.get('NET_VALUE') or (fii_buy - fii_sell))
-
-                # DII
-                dii_buy = self._to_float(
-                    row.get('diiBuy') or row.get('dii_buy') or 0)
-                dii_sell = self._to_float(
-                    row.get('diiSell') or row.get('dii_sell') or 0)
-                dii_net = self._to_float(
-                    row.get('diiNet') or row.get('dii_net') or (dii_buy - dii_sell))
-
-                if not date_str and not fii_buy:
+                if not date_str:
                     continue
 
-                items.append({
+                category = (row.get('category') or row.get('CATEGORY') or '').upper()
+                # Generic buy/sell/net columns (used when category-tagged)
+                buy = self._to_float(row.get('buyValue') or row.get('BUY_VALUE') or 0)
+                sell = self._to_float(row.get('sellValue') or row.get('SELL_VALUE') or 0)
+                net = self._to_float(row.get('netValue') or row.get('NET_VALUE') or
+                                     (buy - sell))
+
+                # Legacy single-row shape: both FII and DII columns coexist.
+                legacy_fii_buy = self._to_float(row.get('fiiBuy') or row.get('fii_buy') or 0)
+                legacy_fii_sell = self._to_float(row.get('fiiSell') or row.get('fii_sell') or 0)
+                legacy_fii_net = self._to_float(
+                    row.get('fiiNet') or row.get('fii_net') or
+                    (legacy_fii_buy - legacy_fii_sell))
+                legacy_dii_buy = self._to_float(row.get('diiBuy') or row.get('dii_buy') or 0)
+                legacy_dii_sell = self._to_float(row.get('diiSell') or row.get('dii_sell') or 0)
+                legacy_dii_net = self._to_float(
+                    row.get('diiNet') or row.get('dii_net') or
+                    (legacy_dii_buy - legacy_dii_sell))
+
+                rec = by_date.setdefault(date_str, {
                     'date': date_str,
-                    'fii_buy': round(fii_buy, 2),
-                    'fii_sell': round(fii_sell, 2),
-                    'fii_net': round(fii_net, 2),
-                    'dii_buy': round(dii_buy, 2),
-                    'dii_sell': round(dii_sell, 2),
-                    'dii_net': round(dii_net, 2),
-                    'combined_net': round(fii_net + dii_net, 2),
+                    'fii_buy': 0.0, 'fii_sell': 0.0, 'fii_net': 0.0,
+                    'dii_buy': 0.0, 'dii_sell': 0.0, 'dii_net': 0.0,
                 })
+
+                if 'FII' in category or 'FPI' in category:
+                    rec['fii_buy'] = buy
+                    rec['fii_sell'] = sell
+                    rec['fii_net'] = net
+                elif 'DII' in category:
+                    rec['dii_buy'] = buy
+                    rec['dii_sell'] = sell
+                    rec['dii_net'] = net
+                else:
+                    # Legacy single-row: prefer explicit dii_/fii_ columns
+                    if legacy_fii_buy or legacy_fii_sell or legacy_fii_net:
+                        rec['fii_buy'] = legacy_fii_buy
+                        rec['fii_sell'] = legacy_fii_sell
+                        rec['fii_net'] = legacy_fii_net
+                    if legacy_dii_buy or legacy_dii_sell or legacy_dii_net:
+                        rec['dii_buy'] = legacy_dii_buy
+                        rec['dii_sell'] = legacy_dii_sell
+                        rec['dii_net'] = legacy_dii_net
             except Exception:
                 continue
+
+        for rec in by_date.values():
+            rec['combined_net'] = round(rec['fii_net'] + rec['dii_net'], 2)
+            for k in ('fii_buy', 'fii_sell', 'fii_net',
+                      'dii_buy', 'dii_sell', 'dii_net'):
+                rec[k] = round(rec[k], 2)
+            items.append(rec)
 
         items.reverse()  # chronological order
         return items[-30:] if items else self._fallback_data()
@@ -147,10 +179,13 @@ class FIIDIIFetcher:
         dii_total = sum(r['dii_net'] for r in recent)
         combined = fii_total + dii_total
 
-        # Trend: last 3 vs previous 3
-        if len(recent) >= 6:
-            last3 = sum(r['fii_net'] for r in recent[-3:])
-            prev3 = sum(r['fii_net'] for r in recent[-6:-3])
+        # Trend: last 3 vs previous 3 — computed off the full fetched series,
+        # not the `days`-bounded summary slice. The summary window (e.g. days=5)
+        # would otherwise structurally prevent the >=6 condition from ever
+        # holding, pinning the trend to "Insufficient data" forever.
+        if len(data) >= 6:
+            last3 = sum(r['fii_net'] for r in data[-3:])
+            prev3 = sum(r['fii_net'] for r in data[-6:-3])
             fii_trend = 'Accelerating' if last3 > prev3 else 'Decelerating'
         else:
             fii_trend = 'Insufficient data'

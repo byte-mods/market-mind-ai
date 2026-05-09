@@ -219,12 +219,79 @@ class MultiAssetFetcher:
         return result
 
     # ── Forex (USD/INR + EUR/INR) ──────────────────────────────────────────────
-    def get_forex(self) -> Dict:
-        """Get USD/INR and EUR/INR from NSE currency derivatives."""
+    def get_forex(self, kite_client=None) -> Dict:
+        """Get USD/INR and EUR/INR — Kite CDS futures first, NSE derivatives fallback.
+
+        Kite serves CDS instrument quotes even outside market hours (last close
+        + prev close), whereas the NSE ``quote-derivative`` endpoint returns
+        an empty ``quoteVFO`` until the CDS session is open. Trying Kite first
+        gives a non-zero ``change_pct`` whenever the user is authenticated.
+        """
         result = {}
         for sym, info in FOREX_SYMBOLS.items():
-            result[sym.lower()] = self._fetch_forex_single(info)
+            row = None
+            if kite_client and getattr(kite_client, 'is_connected', False):
+                row = self._fetch_forex_kite(info, kite_client)
+            if not row:
+                row = self._fetch_forex_single(info)
+            result[sym.lower()] = row
         return result
+
+    def _fetch_forex_kite(self, info: dict, kite_client) -> Optional[Dict]:
+        """Resolve nearest-month USDINR/EURINR future via Kite CDS instruments.
+
+        Returns None on any failure so the caller can fall through to the NSE
+        path. We pick the soonest non-past expiry, then read its OHLC for
+        last-price + previous-day close.
+        """
+        sym = info['nse']
+        cache_key = f"forex_kite_{sym}"
+        cached = self._cache.get(cache_key)
+        if cached and time.time() - cached['ts'] < self._cache_ttl:
+            return cached['data']
+
+        try:
+            from datetime import date as _date
+            insts = kite_client.get_instruments('CDS') or []
+            today = _date.today()
+            futs = [
+                i for i in insts
+                if i.get('name') == sym
+                and i.get('instrument_type') == 'FUT'
+                and isinstance(i.get('expiry'), _date)
+                and (i['expiry'] - today).days >= 0
+            ]
+            if not futs:
+                return None
+            futs.sort(key=lambda i: i['expiry'])
+            tradingsymbol = futs[0]['tradingsymbol']
+            ohlc = kite_client.get_ohlc([f"CDS:{tradingsymbol}"]) or {}
+            quote = ohlc.get(f"CDS:{tradingsymbol}") or {}
+            ltp = float(quote.get('last_price') or 0)
+            prev = float((quote.get('ohlc') or {}).get('close') or 0)
+            # CDS hours are 09:00–17:00 IST. Outside that window Kite returns
+            # last_price=0 but the OHLC envelope still carries the previous
+            # session's close. Use that as the displayable rate so the macro
+            # card shows the most recent quote instead of falling through to
+            # the (broken) NSE estimate.
+            if not ltp and prev:
+                ltp = prev
+            if not ltp:
+                return None
+            chg = round(ltp - prev, 4) if prev else 0.0
+            row = {
+                'symbol': info['name'], 'base': info['base'], 'quote': info['quote'],
+                'rate': ltp, 'prev': prev,
+                'change': chg,
+                'change_pct': round(chg / prev * 100, 3) if prev else 0,
+                'source': 'kite',
+                'expiry': futs[0]['expiry'].isoformat(),
+            }
+            self._cache[cache_key] = {'data': row, 'ts': time.time()}
+            return row
+        except Exception as e:
+            logger.debug(f"Kite forex {sym} fetch error: {e}")
+            return None
 
     def _fetch_forex_single(self, info: dict) -> Dict:
         sym = info['nse']
@@ -238,19 +305,43 @@ class MultiAssetFetcher:
         try:
             data = self._nse_get(f"quote-derivative?symbol={sym}")
             if data:
-                q = data.get('quoteVFO', {}) or {}
-                ltp = float(q.get('lastPrice', 0) or fallback)
-                prev = float(q.get('prevClose', ltp) or ltp)
-                chg = round(ltp - prev, 4)
-                result = {
-                    'symbol': info['name'], 'base': info['base'], 'quote': info['quote'],
-                    'rate': ltp, 'prev': prev,
-                    'change': chg,
-                    'change_pct': round(chg / prev * 100, 3) if prev else 0,
-                    'source': 'nse',
-                }
-                self._cache[cache_key] = {'data': result, 'ts': time.time()}
-                return result
+                # NSE shape: top-level `underlyingValue` (str) is the spot
+                # during CDS hours; outside hours it returns "-". The legacy
+                # `quoteVFO` key does not exist on this endpoint. Try
+                # `underlyingValue` first, then the first front-month future
+                # under `stocks[0].metadata.lastPrice`.
+                ltp = 0.0
+                prev = 0.0
+                uv = data.get('underlyingValue')
+                try:
+                    if uv not in (None, '', '-'):
+                        ltp = float(uv)
+                except (TypeError, ValueError):
+                    ltp = 0.0
+                stocks = data.get('stocks') or []
+                if not ltp and stocks:
+                    md = (stocks[0] or {}).get('metadata') or {}
+                    try:
+                        ltp = float(md.get('lastPrice') or 0)
+                    except (TypeError, ValueError):
+                        ltp = 0.0
+                    try:
+                        prev = float(md.get('prevClose') or 0)
+                    except (TypeError, ValueError):
+                        prev = 0.0
+                if ltp:
+                    if not prev:
+                        prev = ltp
+                    chg = round(ltp - prev, 4)
+                    result = {
+                        'symbol': info['name'], 'base': info['base'], 'quote': info['quote'],
+                        'rate': ltp, 'prev': prev,
+                        'change': chg,
+                        'change_pct': round(chg / prev * 100, 3) if prev else 0,
+                        'source': 'nse',
+                    }
+                    self._cache[cache_key] = {'data': result, 'ts': time.time()}
+                    return result
         except Exception as e:
             logger.debug(f"Forex {sym} fetch error: {e}")
         result = {
@@ -435,7 +526,7 @@ class MultiAssetFetcher:
         """Fetch all multi-asset data at once."""
         return {
             'commodities': self.get_commodities(kite_client) if kite_client else {},
-            'forex': self.get_forex(),
+            'forex': self.get_forex(kite_client),
             'crypto': self.get_crypto(),
             'timestamp': datetime.now().isoformat(),
         }

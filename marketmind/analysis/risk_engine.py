@@ -44,6 +44,62 @@ class RiskEngine:
 
     def __init__(self, price_fetcher=None):
         self._pf = price_fetcher
+        self._symbol_to_sector_cache: Optional[Dict[str, str]] = None
+
+    def _build_symbol_sector_map(self) -> Dict[str, str]:
+        """Reverse-lookup ``stock symbol → sector key`` from SectorClassifier.
+
+        SectorClassifier owns the canonical stock-list per sector. We invert
+        it once and cache so risk-engine consumers (the load-holdings
+        endpoint, debate panellists) can map a Kite tradingsymbol to a
+        sector that has a matching beta in :pyattr:`SECTOR_BETAS`. Symbols
+        not found default to 'Banking' — the median-beta sector — at the
+        call site, not here, so this map remains a pure projection.
+        """
+        if self._symbol_to_sector_cache is not None:
+            return self._symbol_to_sector_cache
+        from marketmind.core.sector_classifier import get_sector_classifier
+        sc = get_sector_classifier()
+        out: Dict[str, str] = {}
+        for sector_key, info in sc.SECTORS.items():
+            for stock in info.get('stocks', []) or []:
+                out[stock.upper()] = sector_key
+        self._symbol_to_sector_cache = out
+        return out
+
+    def sector_for_symbol(self, symbol: str, default: str = 'Banking') -> str:
+        """Return the sector key for a stock symbol, falling back to the
+        median-beta sector when unknown so stress tests still produce a
+        reasonable estimate instead of skipping the position."""
+        return self._build_symbol_sector_map().get(symbol.upper(), default)
+
+    def holdings_from_portfolio(self, portfolio_summary: Dict) -> List[Dict]:
+        """Translate a ``controller.get_portfolio_summary()`` payload into the
+        ``[{symbol, value, sector}]`` shape the risk endpoints expect.
+
+        ``value`` is the live mark-to-market: ``quantity * last_price`` with
+        ``close_price`` as a fallback when the live tick is zero (Kite
+        returns ``last_price=0`` outside market hours). Holdings without a
+        usable price are skipped so portfolio_var doesn't divide by zero.
+        """
+        out: List[Dict] = []
+        for h in (portfolio_summary or {}).get('holdings', []) or []:
+            sym = (h.get('tradingsymbol') or '').upper().strip()
+            if not sym:
+                continue
+            qty = float(h.get('quantity') or 0)
+            ltp = float(h.get('last_price') or 0)
+            if not ltp:
+                ltp = float(h.get('close_price') or h.get('average_price') or 0)
+            value = qty * ltp
+            if value <= 0:
+                continue
+            out.append({
+                'symbol': sym,
+                'value': round(value, 2),
+                'sector': self.sector_for_symbol(sym),
+            })
+        return out
 
     def _get_returns(self, symbol: str, days: int = 252) -> Optional[pd.Series]:
         if self._pf is None:

@@ -17,14 +17,27 @@ class TestMultiAssetFetcherSingleton:
 
 
 class TestForexNSEParsing:
-    """Test _fetch_forex_single against realistic NSE quote-derivative payloads."""
+    """Test _fetch_forex_single against the real NSE quote-derivative shape.
+
+    NSE returns ``underlyingValue`` (a stringified spot rate, or ``"-"`` when
+    the CDS session is closed) plus a ``stocks`` array of futures contracts
+    whose front-month entry carries ``metadata.lastPrice``/``prevClose``.
+    The earlier fixtures used a non-existent ``quoteVFO`` envelope and were
+    false positives — production was always falling through to the estimate.
+    """
 
     def make_nse_response(self, last_price, prev_close):
+        # During CDS hours: underlyingValue carries the spot, stocks[0].metadata
+        # carries the front-month future's last/prev. Tests use the future's
+        # metadata path because that's what gives us prev_close for change_pct.
         return {
-            "quoteVFO": {
-                "lastPrice": last_price,
-                "prevClose": prev_close,
-            }
+            "underlyingValue": "-",  # closed CDS session — force stocks path
+            "stocks": [{
+                "metadata": {
+                    "lastPrice": last_price,
+                    "prevClose": prev_close,
+                }
+            }],
         }
 
     def test_usdinr_parses_live_nse_response(self):
@@ -48,8 +61,29 @@ class TestForexNSEParsing:
         assert result['change'] == pytest.approx(-0.30)
         assert result['source'] == 'nse'
 
+    def test_usdinr_parses_underlying_value_during_cds_hours(self):
+        """During CDS market hours, underlyingValue carries the live spot rate."""
+        maf = MultiAssetFetcher()
+        payload = {"underlyingValue": "84.92", "stocks": []}
+        with patch.object(maf, '_nse_get', return_value=payload):
+            result = maf._fetch_forex_single(FOREX_SYMBOLS['USDINR'])
+        assert result['rate'] == 84.92
+        assert result['source'] == 'nse'
+
+    def test_forex_falls_back_to_estimate_when_market_closed(self):
+        """Outside CDS hours NSE returns underlyingValue='-' and empty stocks;
+        we should report an estimate, not pretend it came from NSE."""
+        maf = MultiAssetFetcher()
+        maf._cache.clear()
+        payload = {"underlyingValue": "-", "stocks": []}
+        with patch.object(maf, '_nse_get', return_value=payload):
+            result = maf._fetch_forex_single(FOREX_SYMBOLS['USDINR'])
+        assert result['rate'] == 84.5  # fallback rate
+        assert result['source'] == 'estimate'
+
     def test_forex_falls_back_to_estimate_on_nse_failure(self):
         maf = MultiAssetFetcher()
+        maf._cache.clear()
         with patch.object(maf, '_nse_get', return_value=None):
             result = maf._fetch_forex_single(FOREX_SYMBOLS['USDINR'])
         assert result['rate'] == 84.5  # fallback rate
@@ -65,8 +99,11 @@ class TestForexNSEParsing:
     def test_get_forex_returns_both_pairs(self):
         maf = MultiAssetFetcher()
         maf._cache.clear()
-        usd_payload = {"quoteVFO": {"lastPrice": 84.75, "prevClose": 84.50}}
-        eur_payload = {"quoteVFO": {"lastPrice": 91.20, "prevClose": 91.50}}
+        def make(lp, pc):
+            return {"underlyingValue": "-",
+                    "stocks": [{"metadata": {"lastPrice": lp, "prevClose": pc}}]}
+        usd_payload = make(84.75, 84.50)
+        eur_payload = make(91.20, 91.50)
 
         def fake_nse_get(path):
             if 'USDINR' in path:
@@ -255,7 +292,8 @@ class TestCrossAssetCorrelations:
         type(mock_kite).is_connected = PropertyMock(return_value=False)
         mock_pf = MagicMock()
 
-        usd_payload = {"quoteVFO": {"lastPrice": 84.75, "prevClose": 84.50}}
+        usd_payload = {"underlyingValue": "-",
+                       "stocks": [{"metadata": {"lastPrice": 84.75, "prevClose": 84.50}}]}
         cg_payload = {"bitcoin": {"inr": 7200000, "inr_24h_change": 2.5},
                        "ethereum": {"inr": 520000, "inr_24h_change": -1.3}}
 

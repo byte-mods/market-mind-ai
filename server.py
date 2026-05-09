@@ -276,9 +276,13 @@ def _get_nifty500_constituents() -> List[Dict[str, str]]:
                 # Skip the index header row and any blanks
                 if not sym or sym.upper() in ('NIFTY 500', 'NIFTY500'):
                     continue
+                # `ffmc` (free-float market cap, in ₹) is what NSE serves on the
+                # equity-stockIndices payload; we surface it as the "market cap"
+                # for the heatmap. Total Mcap isn't in this payload.
                 out.append({
                     'symbol': sym,
                     'sector': (row.get('industry') or row.get('meta', {}).get('industry') or 'Others').strip() or 'Others',
+                    'market_cap': float(row.get('ffmc') or 0),
                 })
             if len(out) > 100:
                 _NIFTY500_CACHE['data'] = out
@@ -302,6 +306,10 @@ async def market_heatmap():
     def fetch():
         constituents = _get_nifty500_constituents()
         sector_map = {c['symbol']: c['sector'] for c in constituents}
+        # Free-float market cap (in ₹) per symbol from NSE equity-stockIndices.
+        # Some constituents predate this enrichment (older cache entries) so we
+        # default to 0.0 when the field is absent.
+        mcap_map = {c['symbol']: c.get('market_cap', 0.0) for c in constituents}
         symbols = [c['symbol'] for c in constituents]
         results = []
 
@@ -334,7 +342,7 @@ async def market_heatmap():
                                 'name': sym,
                                 'price': ltp,
                                 'change_pct': change_pct,
-                                'market_cap': 0,
+                                'market_cap': mcap_map.get(sym, 0),
                                 'sector': sector_map.get(sym, 'Others'),
                             })
                     if len(results) > 10:
@@ -358,7 +366,9 @@ async def market_heatmap():
                             'name': sym,
                             'price': ltp,
                             'change_pct': round(chg, 2),
-                            'market_cap': 0,
+                            # NSE bulk row already gives ffmc per symbol; prefer it
+                            # when present, otherwise fall back to the constituents map.
+                            'market_cap': float(row.get('ffmc') or mcap_map.get(sym, 0)),
                             'sector': sector_map.get(sym, 'Others'),
                         })
             except Exception as e:
@@ -378,7 +388,7 @@ async def market_heatmap():
                     'name': sym,
                     'price': 0,
                     'change_pct': change_pct,
-                    'market_cap': 0,
+                    'market_cap': mcap_map.get(sym, 0),
                     'sector': sector_map.get(sym, 'Others'),
                     'demo': True,
                 })
@@ -527,6 +537,95 @@ async def options_strategy(req: StrategyRequest):
         data = await _run(build_and_analyse)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse(_sanitize(data))
+
+
+# ─── Options Advisor (AI strategy recommender) ───────────────────────────
+
+
+class _AdvisorHeldLeg(BaseModel):
+    action: str   # "BUY" | "SELL"
+    kind: str     # "CE" | "PE"
+    strike: float
+    entry_premium: float
+
+
+class AdvisorRequest(BaseModel):
+    symbol: str
+    held_leg: Optional[_AdvisorHeldLeg] = None
+
+
+@app.post("/api/options/advisor")
+async def options_advisor(req: AdvisorRequest):
+    """AI options advisor — directional bias + vol regime + recommended
+    strategy + price cone + held-position management.
+
+    Composes the live option chain with the RL ensemble's directional read on
+    the same symbol. Output is *educational* — order placement is gated by
+    the SEBI compliance layer separately (`/api/compliance/pretrade-check`).
+    """
+    from marketmind.ml.options.advisor import (
+        directional_bias,
+        manage_position,
+        price_cone,
+        recommend_strategy,
+        vol_regime,
+    )
+
+    sym = req.symbol.upper()
+    fetcher = get_options_fetcher()
+
+    def build():
+        # 1. Chain — try NSE then Kite, mirroring /api/stocks/{symbol}/options
+        chain = fetcher.get_option_chain(sym)
+        if not chain or chain.get("unavailable") or not chain.get("calls"):
+            kite = controller.kite if controller.kite_is_authenticated else None
+            if kite and kite.is_connected:
+                kchain = fetcher.get_option_chain_from_kite(sym, kite)
+                if kchain and kchain.get("calls"):
+                    chain = kchain
+
+        if not chain or not chain.get("calls"):
+            return {
+                "symbol": sym,
+                "unavailable": True,
+                "reason": (chain or {}).get("reason", "options chain unavailable"),
+            }
+
+        # 2. RL signal as directional prior. Failure here is non-fatal —
+        #    advisor degrades to PCR/skew-only bias if no signal cached for sym.
+        rl_signal = None
+        try:
+            rl_signal = controller.get_rl_signal_for_stock(sym)
+        except Exception:
+            rl_signal = None
+
+        bias = directional_bias(chain, rl_signal)
+        regime = vol_regime(chain)
+        cone = price_cone(chain)
+        strategy = recommend_strategy(chain, bias, regime)
+
+        out = {
+            "symbol": sym,
+            "underlying": chain.get("underlying"),
+            "atm_strike": chain.get("atm_strike"),
+            "max_pain": chain.get("max_pain"),
+            "pcr": chain.get("pcr"),
+            "days_to_expiry": chain.get("days_to_expiry"),
+            "bias": bias,
+            "regime": regime,
+            "price_cone": cone,
+            "strategy": strategy,
+            "disclaimer": "Educational only. Not investment advice. SEBI-compliant pre-trade check is gated separately.",
+        }
+
+        if req.held_leg:
+            held = req.held_leg.dict()
+            out["position_management"] = manage_position(held, chain)
+
+        return out
+
+    data = await _run(build)
     return JSONResponse(_sanitize(data))
 
 
@@ -1544,55 +1643,97 @@ async def rl_multiframe(refresh: bool = False):
                 above_ma200= c_vs_ma200 > 0
 
                 macd_cross_up = prev_macd <= 0 and macd_h > 0
+                macd_cross_dn = prev_macd >= 0 and macd_h < 0
 
-                # ── Intraday: RSI + MACD crossover + volume
-                if rsi < 42 and macd_cross_up and vol_ratio > 1.2:
-                    intraday.append({'symbol': sym, 'action': 'BUY',
-                        'confidence': round(min(0.88, 0.52 + vol_ratio * 0.08), 2),
-                        'entry': cp, 'target': round(cp * 1.015, 2),
-                        'sl': round(cp * 0.992, 2), 'horizon': 'Intraday',
-                        'reason': f"RSI {rsi:.0f} oversold + MACD cross + vol×{vol_ratio:.1f}"})
-                elif rsi > 70 and macd_h < 0 and vol_ratio > 1.2:
-                    intraday.append({'symbol': sym, 'action': 'SELL',
-                        'confidence': round(min(0.85, 0.52 + vol_ratio * 0.08), 2),
-                        'entry': cp, 'target': round(cp * 0.985, 2),
-                        'sl': round(cp * 1.008, 2), 'horizon': 'Intraday',
-                        'reason': f"RSI {rsi:.0f} overbought + bearish MACD + vol×{vol_ratio:.1f}"})
+                # ── Intraday score: weighted blend of mean-reversion + momentum + volume.
+                #    Sign of the score determines BUY (>0) vs SELL (<0).
+                rsi_dev = (50.0 - rsi) / 50.0  # +1 deeply oversold, -1 deeply overbought
+                intraday_score = (
+                    0.4 * rsi_dev
+                    + 0.3 * (1.0 if macd_cross_up else (-1.0 if macd_cross_dn else 0.0))
+                    + 0.2 * (1.0 if macd_h > 0 else -1.0) * min(abs(macd_h), 5) / 5
+                    + 0.1 * min(vol_ratio - 1.0, 1.0)
+                )
+                action_i = 'BUY' if intraday_score > 0 else 'SELL'
+                conf_i = round(min(0.92, 0.45 + abs(intraday_score) * 0.45), 2)
+                target_pct_i = 0.015 if action_i == 'BUY' else -0.015
+                sl_pct_i = -0.008 if action_i == 'BUY' else 0.008
+                gate_i = (rsi < 42 and macd_cross_up and vol_ratio > 1.2) or \
+                         (rsi > 70 and macd_h < 0 and vol_ratio > 1.2)
+                intraday.append({
+                    'symbol': sym, 'action': action_i, 'confidence': conf_i,
+                    'score': round(intraday_score, 3),
+                    'entry': cp, 'target': round(cp * (1 + target_pct_i), 2),
+                    'sl': round(cp * (1 + sl_pct_i), 2), 'horizon': 'Intraday',
+                    'reason': (
+                        f"RSI {rsi:.0f}, vol×{vol_ratio:.1f}, "
+                        f"MACD {'↑' if macd_h > 0 else '↓'}{abs(macd_h):.2f}"
+                    ),
+                    'gate_pass': gate_i,
+                })
 
-                # ── Swing: momentum + MA50
-                if m20 > 0.03 and above_ma50 and macd_h > 0:
-                    swing.append({'symbol': sym, 'action': 'BUY',
-                        'confidence': round(min(0.85, 0.48 + min(m20, 0.15) * 2.5), 2),
-                        'entry': cp, 'target': round(cp * 1.08, 2),
-                        'sl': round(ma20_val * 0.99, 2), 'horizon': '2–4 weeks',
-                        'reason': f"+{m20*100:.1f}% 20d momentum, above MA50"})
-                elif m20 < -0.03 and not above_ma50 and macd_h < 0:
-                    swing.append({'symbol': sym, 'action': 'SELL',
-                        'confidence': round(min(0.82, 0.48 + min(abs(m20), 0.15) * 2.5), 2),
-                        'entry': cp, 'target': round(cp * 0.93, 2),
-                        'sl': round(ma50_val * 1.01, 2), 'horizon': '2–4 weeks',
-                        'reason': f"{m20*100:.1f}% 20d momentum, below MA50"})
+                # ── Swing score: 20-day momentum + trend filter (MA50) + MACD direction.
+                swing_score = (
+                    0.5 * max(min(m20, 0.15), -0.15) / 0.15
+                    + 0.3 * (1.0 if above_ma50 else -1.0)
+                    + 0.2 * (1.0 if macd_h > 0 else -1.0)
+                )
+                action_s = 'BUY' if swing_score > 0 else 'SELL'
+                conf_s = round(min(0.90, 0.45 + abs(swing_score) * 0.40), 2)
+                tgt_s = 1.08 if action_s == 'BUY' else 0.93
+                sl_anchor_s = ma20_val if action_s == 'BUY' else ma50_val
+                sl_mult_s = 0.99 if action_s == 'BUY' else 1.01
+                gate_s = (m20 > 0.03 and above_ma50 and macd_h > 0) or \
+                         (m20 < -0.03 and not above_ma50 and macd_h < 0)
+                swing.append({
+                    'symbol': sym, 'action': action_s, 'confidence': conf_s,
+                    'score': round(swing_score, 3),
+                    'entry': cp, 'target': round(cp * tgt_s, 2),
+                    'sl': round(sl_anchor_s * sl_mult_s, 2), 'horizon': '2–4 weeks',
+                    'reason': (
+                        f"{m20*100:+.1f}% 20d mom, "
+                        f"{'above' if above_ma50 else 'below'} MA50, MACD {macd_h:+.2f}"
+                    ),
+                    'gate_pass': gate_s,
+                })
 
-                # ── Positional: MA200 + trend strength
-                if above_ma200 and above_ma50 and m20 > 0.05 and rsi < 65:
-                    positional.append({'symbol': sym, 'action': 'BUY',
-                        'confidence': round(min(0.90, 0.60 + min(m20, 0.2) * 1.5), 2),
-                        'entry': cp, 'target': round(cp * 1.20, 2),
-                        'sl': round(cp / (1 + c_vs_ma200) * 0.97, 2), 'horizon': '3–6 months',
-                        'reason': f"Above MA200+MA50, +{m20*100:.1f}% mom, RSI {rsi:.0f}"})
-                elif not above_ma200 and m20 < -0.05 and rsi > 50:
-                    positional.append({'symbol': sym, 'action': 'SELL',
-                        'confidence': round(min(0.82, 0.55 + min(abs(m20), 0.2) * 1.5), 2),
-                        'entry': cp, 'target': round(cp * 0.85, 2),
-                        'sl': round(cp * 1.05, 2), 'horizon': '3–6 months',
-                        'reason': f"Below MA200, {m20*100:.1f}% mom, RSI {rsi:.0f}"})
+                # ── Positional score: MA200/MA50 alignment + medium-term momentum.
+                trend_align = (1 if above_ma200 else -1) + (0.5 if above_ma50 else -0.5)
+                pos_score = (
+                    0.5 * trend_align / 1.5
+                    + 0.4 * max(min(m20, 0.20), -0.20) / 0.20
+                    + 0.1 * (1.0 if 30 < rsi < 65 else -0.5)
+                )
+                action_p = 'BUY' if pos_score > 0 else 'SELL'
+                conf_p = round(min(0.92, 0.55 + abs(pos_score) * 0.40), 2)
+                tgt_p = 1.20 if action_p == 'BUY' else 0.85
+                if action_p == 'BUY':
+                    sl_p = cp / (1 + c_vs_ma200) * 0.97 if c_vs_ma200 != -1 else cp * 0.92
+                else:
+                    sl_p = cp * 1.05
+                gate_p = (above_ma200 and above_ma50 and m20 > 0.05 and rsi < 65) or \
+                         (not above_ma200 and m20 < -0.05 and rsi > 50)
+                positional.append({
+                    'symbol': sym, 'action': action_p, 'confidence': conf_p,
+                    'score': round(pos_score, 3),
+                    'entry': cp, 'target': round(cp * tgt_p, 2),
+                    'sl': round(sl_p, 2), 'horizon': '3–6 months',
+                    'reason': (
+                        f"{'Above' if above_ma200 else 'Below'} MA200, "
+                        f"{m20*100:+.1f}% mom, RSI {rsi:.0f}"
+                    ),
+                    'gate_pass': gate_p,
+                })
 
             except Exception as e:
                 logger.debug(f"RL signal error for {sym}: {e}")
 
-        # Sort by confidence
+        # Sort each timeframe by absolute score (strongest signal first).
+        # gate_pass entries get a small additive bonus so true gate hits float
+        # to the top when scores are tied.
         for lst in [intraday, swing, positional]:
-            lst.sort(key=lambda x: x['confidence'], reverse=True)
+            lst.sort(key=lambda x: abs(x['score']) + (0.05 if x.get('gate_pass') else 0),
+                     reverse=True)
 
         # If still empty (no Kite + no NSE), use demo signals
         if not intraday and not swing and not positional:
@@ -1867,12 +2008,40 @@ async def kite_logout():
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'local.json')
 
+# Watchlist + non-secret app settings live in SQLite (`marketmind.db`,
+# `settings` table). The `local.json` file remains the source of truth for
+# secrets (Kite API key/secret, Anthropic key) and is kept gitignored. We
+# mirror the watchlist into local.json on every save so the existing
+# kite_config / event_poller / app_controller readers continue to work
+# without a wider refactor.
+from marketmind.core.database import Database as _SettingsDB
+_settings_db = _SettingsDB()
+
+
+def _load_local_config() -> Dict[str, Any]:
+    """Read local.json — used for secrets and as legacy-fallback for watchlist."""
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
 
 @app.get("/api/config")
 async def get_config():
+    """Return merged config: SQLite settings (watchlist, app prefs) overlaid
+    on top of local.json for secrets metadata. Secrets are masked."""
     try:
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
+        cfg = _load_local_config()
+        # Prefer SQLite-stored watchlist; fall back to local.json for legacy
+        # installs that haven't migrated yet.
+        wl_db = _settings_db.get_setting('watchlist')
+        if wl_db:
+            cfg['watchlist'] = wl_db
+        # SQLite-owned app prefs override local.json
+        app_db = _settings_db.get_setting('app')
+        if app_db:
+            cfg.setdefault('app', {}).update(app_db)
         # Mask secrets
         if 'kite' in cfg:
             cfg['kite']['api_secret'] = '***'
@@ -1890,13 +2059,19 @@ class ConfigUpdate(BaseModel):
 
 @app.put("/api/config")
 async def update_config(req: ConfigUpdate):
+    """Persist watchlist / app prefs to SQLite, mirror watchlist to local.json
+    so legacy non-DB consumers (kite_config, event_poller) keep working."""
     try:
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
+        cfg = _load_local_config()
         if req.watchlist is not None:
-            cfg['watchlist'] = [s.upper() for s in req.watchlist]
+            normalised = [s.upper() for s in req.watchlist if s and s.strip()]
+            _settings_db.set_setting('watchlist', normalised)
+            cfg['watchlist'] = normalised  # mirror for legacy readers
         if req.app is not None:
-            cfg.setdefault('app', {}).update(req.app)
+            existing = _settings_db.get_setting('app') or {}
+            existing.update(req.app)
+            _settings_db.set_setting('app', existing)
+            cfg.setdefault('app', {}).update(req.app)  # mirror
         with open(CONFIG_PATH, 'w') as f:
             json.dump(cfg, f, indent=2)
         controller.kite_config.reload()
@@ -1939,7 +2114,10 @@ async def bulk_deals(days: int = 7):
 @app.get("/api/macro")
 async def macro_dashboard():
     fetcher = get_macro_fetcher()
-    result = await _run(fetcher.get_all)
+    # Pass kite client so USD/INR resolves via the Kite CDS path (the public
+    # NSE quote-derivative endpoint returns "-" for underlyingValue outside
+    # CDS hours, pinning the macro card to its fallback otherwise).
+    result = await _run(fetcher.get_all, controller.kite)
     return JSONResponse(_sanitize(result))
 
 
@@ -1973,9 +2151,9 @@ async def multiasset_commodities():
 
 @app.get("/api/multiasset/forex")
 async def multiasset_forex():
-    """USD/INR + EUR/INR forex rates via NSE currency derivatives."""
+    """USD/INR + EUR/INR forex rates — Kite CDS futures first, NSE fallback."""
     maf = get_multiasset_fetcher()
-    result = await _run(maf.get_forex)
+    result = await _run(maf.get_forex, controller.kite)
     return JSONResponse(_sanitize(result))
 
 
@@ -2186,6 +2364,30 @@ async def calibrated_signal(sym: str, horizon: int = 5):
 async def stock_risk(symbol: str, holding_value: float = 100000):
     engine = get_risk_engine()
     result = await _run(engine.stock_var, symbol.upper(), 0.95, holding_value)
+    return JSONResponse(_sanitize(result))
+
+
+@app.get("/api/risk/load-holdings")
+async def risk_load_holdings():
+    """Return the user's Kite holdings reshaped for the Risk Analytics page.
+
+    The Risk page used to require manual entry of every position (symbol,
+    value, sector) which made it feel like a demo. This endpoint pulls the
+    real Kite portfolio, marks each row to market (with `close_price` as a
+    fallback for after-hours), and classifies the sector via
+    SectorClassifier so stress-test betas resolve correctly.
+    """
+    engine = get_risk_engine()
+    def fetch():
+        summary = controller.get_portfolio_summary() or {}
+        holdings = engine.holdings_from_portfolio(summary)
+        return {
+            'holdings': holdings,
+            'authenticated': bool(summary.get('authenticated', True)),
+            'count': len(holdings),
+            'total_value': round(sum(h['value'] for h in holdings), 2),
+        }
+    result = await _run(fetch)
     return JSONResponse(_sanitize(result))
 
 
@@ -2676,9 +2878,31 @@ async def predict_rl_signal(symbol: str):
             ql_sig['ppo_confidence'] = ppo_sig['confidence']
             # Override action with PPO if confident
             if ppo_sig['confidence'] >= 0.55:
+                prev_action          = ql_sig.get('action')
                 ql_sig['action']     = ppo_sig['action']
                 ql_sig['confidence'] = ppo_sig['confidence']
                 ql_sig['method']     = 'PPO'
+                # Recompute target/SL when the override flips direction —
+                # otherwise a SELL-shaped target (below entry) sticks on a
+                # BUY signal, which is how the UI was showing nonsense like
+                # "BUY @1435, target 1320, SL 1471". Reuse the same risk
+                # params get_combined_signal honoured.
+                if prev_action != ql_sig['action']:
+                    rl_data  = ql_sig.get('rl_signal') or {}
+                    rp       = (rl_data.get('risk_params') or {}) if isinstance(rl_data, dict) else {}
+                    sl_pct   = float(rp.get('stop_loss_pct', 2.5))
+                    tp_pct   = float(rp.get('take_profit_pct', 8.0))
+                    entry    = float(ql_sig.get('entry_price') or 0)
+                    if entry > 0:
+                        if ql_sig['action'] == 'BUY':
+                            ql_sig['target'] = round(entry * (1 + tp_pct / 100), 2)
+                            ql_sig['sl']     = round(entry * (1 - sl_pct / 100), 2)
+                        elif ql_sig['action'] == 'SELL':
+                            ql_sig['target'] = round(entry * (1 - tp_pct / 100), 2)
+                            ql_sig['sl']     = round(entry * (1 + sl_pct / 100), 2)
+                        else:  # HOLD
+                            ql_sig['target'] = entry
+                            ql_sig['sl']     = entry
             else:
                 ql_sig['method']     = 'RL+ML'
         return ql_sig

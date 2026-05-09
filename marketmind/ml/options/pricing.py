@@ -120,3 +120,46 @@ def bs_greeks(
 def days_to_T(days: float) -> float:
     """Convert calendar days-to-expiry into year fraction."""
     return max(float(days), 0.0) / DAYS_PER_YEAR
+
+
+def implied_vol(
+    market_price: float,
+    S: float,
+    K: float,
+    T: float,
+    kind: OptionKind,
+    r: float = DEFAULT_RISK_FREE,
+    tol: float = 1e-4,
+    max_iter: int = 60,
+) -> float:
+    """Back-solve Black-Scholes implied volatility from a market price.
+
+    Uses bisection in [1e-4, 5.0] (i.e. 0.01% – 500% annualised vol).
+    Returns 0.0 when the price violates no-arbitrage bounds (e.g. quote is below
+    intrinsic, expired option, or zero LTP) so the caller can flag the strike
+    as IV-unavailable instead of poisoning downstream Greeks with a bad number.
+    """
+    if market_price <= 0 or T <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    intrinsic = max(S - K, 0.0) if kind == "CE" else max(K - S, 0.0)
+    if market_price < intrinsic - 1e-6:
+        return 0.0  # arb-violating quote — refuse rather than mislead.
+    lo, hi = 1e-4, 5.0
+    p_lo = bs_price(S, K, T, lo, kind, r)
+    p_hi = bs_price(S, K, T, hi, kind, r)
+    # Price is monotonic in vol — if the target lies outside [p_lo, p_hi] the
+    # quote is unreachable under BS at any vol. Clamp to nearest endpoint.
+    if market_price <= p_lo:
+        return lo
+    if market_price >= p_hi:
+        return hi
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        p_mid = bs_price(S, K, T, mid, kind, r)
+        if abs(p_mid - market_price) < tol:
+            return mid
+        if p_mid < market_price:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)

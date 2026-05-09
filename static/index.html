@@ -1205,6 +1205,58 @@ h3{
       <tbody id="options-tbody"></tbody>
     </table>
   </div>
+
+  <!-- ─── AI Strategy Advisor ─── -->
+  <div class="card" style="margin-top:18px;padding:14px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <h3 style="margin:0;">AI Strategy Advisor</h3>
+      <span style="font-size:10px;color:var(--muted);">Educational only — not investment advice</span>
+    </div>
+
+    <div class="grid4" style="margin-bottom:12px;">
+      <div class="metric-card"><div class="label">Directional Bias</div><div class="value" id="adv-bias-label">—</div><div class="sub" id="adv-bias-score">—</div></div>
+      <div class="metric-card"><div class="label">Vol Regime</div><div class="value" id="adv-regime-label">—</div><div class="sub" id="adv-regime-iv">—</div></div>
+      <div class="metric-card"><div class="label">Strategy</div><div class="value" id="adv-strategy-name" style="font-size:16px;">—</div><div class="sub" id="adv-strategy-net">—</div></div>
+      <div class="metric-card"><div class="label">Mid Range (5d)</div><div class="value" id="adv-cone-mid" style="font-size:16px;">—</div><div class="sub" id="adv-cone-band">—</div></div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+      <div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Bias components</div>
+        <ul id="adv-bias-components" style="font-size:12px;margin:0;padding-left:18px;color:var(--text);"></ul>
+
+        <div style="font-size:12px;color:var(--muted);margin:12px 0 6px;">Strategy rationale</div>
+        <div id="adv-strategy-rationale" style="font-size:12px;color:var(--text);">—</div>
+
+        <div style="font-size:12px;color:var(--muted);margin:12px 0 6px;">Legs</div>
+        <table style="width:100%;font-size:11px;">
+          <thead><tr style="text-align:left;color:var(--muted);">
+            <th>Action</th><th>Type</th><th>Strike</th><th>Premium</th>
+          </tr></thead>
+          <tbody id="adv-legs-tbody"></tbody>
+        </table>
+      </div>
+
+      <div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Price cone (1σ)</div>
+        <table style="width:100%;font-size:12px;">
+          <thead><tr style="text-align:right;color:var(--muted);"><th style="text-align:left;">Horizon</th><th>Low</th><th>Mid</th><th>High</th></tr></thead>
+          <tbody id="adv-cone-tbody"></tbody>
+        </table>
+
+        <div style="font-size:12px;color:var(--muted);margin:14px 0 6px;">Position management (if you hold a leg)</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;">
+          <select id="adv-held-action" style="padding:4px 8px;font-size:11px;"><option value="">— action —</option><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
+          <select id="adv-held-kind" style="padding:4px 8px;font-size:11px;"><option value="">— type —</option><option value="CE">CE</option><option value="PE">PE</option></select>
+          <input id="adv-held-strike" placeholder="strike" style="width:90px;padding:4px 8px;font-size:11px;">
+          <input id="adv-held-entry" placeholder="entry premium" style="width:120px;padding:4px 8px;font-size:11px;">
+          <button onclick="loadOptionsAdvisor()" style="padding:4px 10px;font-size:11px;background:var(--accent);color:white;border:none;border-radius:4px;cursor:pointer;">Evaluate</button>
+        </div>
+        <ul id="adv-mgmt-rules" style="font-size:12px;margin:0;padding-left:18px;color:var(--text);"></ul>
+        <div id="adv-mgmt-stats" style="font-size:11px;color:var(--muted);margin-top:6px;"></div>
+      </div>
+    </div>
+  </div>
 </section>
 
 <!-- ══════════════════ SCREENER ══════════════════ -->
@@ -1967,6 +2019,8 @@ h3{
           </select>
         </div>
         <button onclick="addRiskHolding()">+ Add</button>
+        <button onclick="loadRiskHoldingsFromKite()">📥 Load my Kite holdings</button>
+        <button onclick="clearRiskHoldings()">Clear</button>
         <button class="primary" onclick="calcPortfolioRisk()">Analyse Risk</button>
       </div>
       <div id="risk-holdings-list" style="margin-top:10px;"></div>
@@ -3199,6 +3253,7 @@ async function loadOptions() {
       throw new Error(reason);
     }
     renderOptionsChain(_optData);
+    loadOptionsAdvisor();  // refresh AI advisor for the same symbol
   } catch(e) {
     document.getElementById('options-tbody').innerHTML =
       `<tr><td colspan="11" style="text-align:center;padding:24px;color:var(--muted);">
@@ -3208,6 +3263,90 @@ async function loadOptions() {
       </td></tr>`;
     destroyChart('oi');
     toast(`Options chain unavailable for ${sym}`, 'red');
+  }
+}
+
+// ─── AI Strategy Advisor ───────────────────────────────────────────────
+async function loadOptionsAdvisor() {
+  const sym = document.getElementById('opt-symbol').value.trim().toUpperCase();
+  if (!sym) return;
+
+  // Optional held-leg input
+  const action = document.getElementById('adv-held-action').value;
+  const kind = document.getElementById('adv-held-kind').value;
+  const strike = parseFloat(document.getElementById('adv-held-strike').value);
+  const entry = parseFloat(document.getElementById('adv-held-entry').value);
+  const held = (action && kind && strike > 0 && entry > 0)
+    ? {action, kind, strike, entry_premium: entry} : null;
+
+  try {
+    const data = await API.post('/options/advisor', {symbol: sym, held_leg: held});
+    if (!data || data.unavailable) {
+      document.getElementById('adv-bias-label').textContent = '—';
+      document.getElementById('adv-strategy-name').textContent = data?.reason || 'Unavailable';
+      return;
+    }
+    renderOptionsAdvisor(data);
+  } catch(e) {
+    console.error('Advisor error:', e);
+  }
+}
+
+function renderOptionsAdvisor(d) {
+  // Bias
+  const bias = d.bias || {};
+  const biasEl = document.getElementById('adv-bias-label');
+  biasEl.textContent = bias.label || '—';
+  biasEl.style.color = bias.label === 'Bullish' ? 'var(--green)'
+                     : bias.label === 'Bearish' ? 'var(--red)' : 'var(--text)';
+  document.getElementById('adv-bias-score').textContent =
+    bias.score != null ? `Score ${bias.score >= 0 ? '+' : ''}${bias.score}` : '—';
+  const bcUL = document.getElementById('adv-bias-components');
+  bcUL.innerHTML = (bias.components || []).map(c => `<li>${c}</li>`).join('') || '<li>—</li>';
+
+  // Regime
+  const regime = d.regime || {};
+  document.getElementById('adv-regime-label').textContent = regime.label || '—';
+  document.getElementById('adv-regime-iv').textContent = regime.reason || '—';
+
+  // Strategy
+  const strat = d.strategy || {};
+  document.getElementById('adv-strategy-name').textContent = strat.strategy || '—';
+  document.getElementById('adv-strategy-net').textContent =
+    strat.net != null ? `${strat.type} ₹${Math.abs(strat.net).toFixed(2)}` : '—';
+  document.getElementById('adv-strategy-rationale').textContent = strat.rationale || '—';
+  const legsTB = document.getElementById('adv-legs-tbody');
+  legsTB.innerHTML = (strat.legs || []).map(lg => `
+    <tr>
+      <td style="color:${lg.action === 'BUY' ? 'var(--green)' : 'var(--red)'};">${lg.action}</td>
+      <td>${lg.kind}</td>
+      <td>${lg.strike}</td>
+      <td>₹${(lg.premium || 0).toFixed(2)}</td>
+    </tr>`).join('') || '<tr><td colspan="4" style="color:var(--muted);">No legs.</td></tr>';
+
+  // Price cone
+  const cone = d.price_cone || {};
+  const coneTB = document.getElementById('adv-cone-tbody');
+  coneTB.innerHTML = ['1d','5d','20d'].map(h => {
+    const c = cone[h] || {};
+    return `<tr style="text-align:right;"><td style="text-align:left;">${h}</td><td>${c.low ?? '—'}</td><td>${c.mid ?? '—'}</td><td>${c.high ?? '—'}</td></tr>`;
+  }).join('');
+  if (cone['5d']) {
+    document.getElementById('adv-cone-mid').textContent = cone['5d'].mid;
+    document.getElementById('adv-cone-band').textContent = `${cone['5d'].low} – ${cone['5d'].high}`;
+  }
+
+  // Position management
+  const mgmt = d.position_management;
+  const rulesUL = document.getElementById('adv-mgmt-rules');
+  const statsEl = document.getElementById('adv-mgmt-stats');
+  if (mgmt) {
+    rulesUL.innerHTML = (mgmt.rules || []).map(r => `<li>${r}</li>`).join('');
+    const g = mgmt.greeks || {};
+    statsEl.textContent = `LTP ₹${mgmt.current_ltp} · entry ₹${mgmt.entry_premium} · P&L ${mgmt.pnl_pct}% · Δ${g.delta} Γ${g.gamma} Θ${g.theta}/d ν${g.vega} · ${mgmt.dte}d to expiry`;
+  } else {
+    rulesUL.innerHTML = '<li style="color:var(--muted);">Enter a held leg above and click Evaluate.</li>';
+    statsEl.textContent = '';
   }
 }
 
@@ -4093,13 +4232,24 @@ async function kiteLogout() {
 }
 
 async function saveWatchlist() {
-  const symbols = document.getElementById('watchlist-input').value.split('\n').map(s=>s.trim().toUpperCase()).filter(s=>s);
+  // Symbols are line-separated, normalised to upper-case, blanks dropped.
+  const symbols = document.getElementById('watchlist-input').value
+    .split('\n').map(s => s.trim().toUpperCase()).filter(Boolean);
   try {
-    await API.post('/config', {watchlist: symbols});
-    // Use PUT
-    const r = await fetch('/api/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({watchlist:symbols})});
-    toast('Watchlist saved!', 'green');
-  } catch(e) { toast('Save failed: ' + e.message, 'red'); }
+    // Single PUT — the prior version also fired a phantom POST that 405'd
+    // and short-circuited the real save via the catch block.
+    const r = await fetch('/api/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({watchlist: symbols}),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const out = await r.json();
+    if (!out.saved) throw new Error('server did not confirm save');
+    toast(`Watchlist saved (${symbols.length} symbols)`, 'green');
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'red');
+  }
 }
 
 async function saveConfig() {
@@ -4468,7 +4618,22 @@ async function loadCrossAsset() {
 // ═══════════════════════════════════════════════════════════════════════
 // RISK ANALYTICS
 // ═══════════════════════════════════════════════════════════════════════
-let _riskHoldings = [];
+// Risk holdings are persisted in localStorage so the Portfolio Risk and
+// Stress Test tabs survive page reloads. `loadRiskHoldingsFromKite` and
+// `addRiskHolding` write through here; `renderRiskHoldings` is the only
+// reader so persistence stays implicit.
+const _RISK_HOLDINGS_KEY = 'mm.riskHoldings.v1';
+function _persistRiskHoldings() {
+  try { localStorage.setItem(_RISK_HOLDINGS_KEY, JSON.stringify(_riskHoldings)); }
+  catch (e) { /* quota exceeded / private mode — not fatal */ }
+}
+function _restoreRiskHoldings() {
+  try {
+    const raw = localStorage.getItem(_RISK_HOLDINGS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) { return []; }
+}
+let _riskHoldings = _restoreRiskHoldings();
 
 function riskTab(name, btn) {
   ['stock','portfolio','stress'].forEach(t => {
@@ -4506,9 +4671,35 @@ function addRiskHolding() {
   const sec = document.getElementById('rp-sector').value;
   if (!sym || !val) { toast('Fill symbol and value','red'); return; }
   _riskHoldings.push({symbol:sym, value:val, sector:sec});
+  _persistRiskHoldings();
   renderRiskHoldings();
   document.getElementById('rp-sym').value='';
   document.getElementById('rp-val').value='';
+}
+
+function clearRiskHoldings() {
+  _riskHoldings = [];
+  _persistRiskHoldings();
+  renderRiskHoldings();
+  document.getElementById('risk-portfolio-results').innerHTML = '';
+  document.getElementById('stress-results').innerHTML = '';
+}
+
+async function loadRiskHoldingsFromKite() {
+  toast('Loading Kite holdings...', 'blue');
+  try {
+    const d = await API.get('/risk/load-holdings');
+    if (!d.holdings || !d.holdings.length) {
+      toast(d.authenticated ? 'No holdings found in Kite' : 'Kite not authenticated', 'orange');
+      return;
+    }
+    _riskHoldings = d.holdings;
+    _persistRiskHoldings();
+    renderRiskHoldings();
+    toast(`Loaded ${d.count} holdings (₹${(d.total_value/100000).toFixed(1)}L)`, 'green');
+  } catch (e) {
+    toast('Load failed: ' + e.message, 'red');
+  }
 }
 
 function renderRiskHoldings() {
@@ -4522,7 +4713,7 @@ function renderRiskHoldings() {
         <span>₹${(h.value/1000).toFixed(0)}K</span>
         <span class="muted">${(h.value/total*100).toFixed(1)}%</span>
         <span class="muted">${h.sector}</span>
-        <button onclick="_riskHoldings.splice(${i},1);renderRiskHoldings()" style="font-size:10px;padding:1px 5px;">✕</button>
+        <button onclick="_riskHoldings.splice(${i},1);_persistRiskHoldings();renderRiskHoldings()" style="font-size:10px;padding:1px 5px;">✕</button>
       </div>`).join('') + '</div>';
 }
 
@@ -5310,7 +5501,7 @@ function loadSection(name) {
     case 'crossasset': loadCrossAsset(); break;
     case 'candles': loadCandles(); break;
     case 'aitrain': loadSavedModels(); loadDeployedBots(); break;
-    case 'risk': /* on demand */ break;
+    case 'risk': renderRiskHoldings(); break;  // restore persisted holdings
     case 'optimizer': loadOptimizer(); break;
     case 'research': refreshRagStats(); break;
     case 'debate': /* on demand */ break;
@@ -6114,6 +6305,26 @@ async function loadConfluenceOnly() {
 
 async function loadSavedModels() {
   try {
+    // Sync bot-active state from the server FIRST. Otherwise a page reload
+    // would leave _botActive empty and the model row would offer "Deploy"
+    // for a symbol whose bot is still running server-side — racing to
+    // double-deploy if clicked.
+    try {
+      const statuses = await API.get('/bot/status');
+      const active = (statuses || []).filter(b => b.active).map(b => b.symbol);
+      _botActive = {};
+      active.forEach(s => { _botActive[s] = true; });
+      // Restore client-side cycle timers for any server-active bot that
+      // doesn't have one yet (e.g. after page reload). Without this, the
+      // bot remains "deployed" but no cycles fire from this tab.
+      const interval = parseInt(document.getElementById('bot-interval')?.value || '300000');
+      active.forEach(sym => {
+        if (!_botTimer[sym]) {
+          _botTimer[sym] = setInterval(() => botCycle(sym), interval);
+        }
+      });
+    } catch (e) { /* status endpoint failure is non-fatal */ }
+
     const models = await API.get('/rl/models');
     const el = document.getElementById('models-table');
     if (!models || !models.length) {

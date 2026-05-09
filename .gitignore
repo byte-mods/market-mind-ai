@@ -2,6 +2,7 @@
 # Secrets — NEVER commit
 # ─────────────────────────────────────────────────────────────────────────────
 local.json
+local.*.json
 .env
 .env.*
 !.env.example
@@ -11,6 +12,15 @@ local.json
 *.crt
 secrets/
 credentials.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local DB / state (user-private — watchlist, prefs, cached candles, history)
+# ─────────────────────────────────────────────────────────────────────────────
+marketmind.db
+candles.db
+*.sqlite
+*.sqlite3
+.history/
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Python

@@ -123,3 +123,29 @@ def test_pricing_days_to_T_converts_calendar_days_to_year_fraction():
     assert days_to_T(365) == pytest.approx(1.0)
     assert days_to_T(30) == pytest.approx(30 / 365.0)
     assert days_to_T(-3) == 0.0  # clamped
+
+
+# ─── implied vol ──────────────────────────────────────────────────────────
+
+from marketmind.ml.options.pricing import implied_vol
+
+
+def test_implied_vol_recovers_known_sigma_atm_call():
+    S, K, T, sigma = 100.0, 100.0, 30 / 365.0, 0.25
+    px = bs_price(S, K, T, sigma, "CE")
+    assert implied_vol(px, S, K, T, "CE") == pytest.approx(sigma, abs=1e-3)
+
+
+def test_implied_vol_recovers_known_sigma_otm_put():
+    S, K, T, sigma = 100.0, 90.0, 60 / 365.0, 0.40
+    px = bs_price(S, K, T, sigma, "PE")
+    assert implied_vol(px, S, K, T, "PE") == pytest.approx(sigma, abs=1e-3)
+
+
+def test_implied_vol_returns_zero_on_arb_violating_quote():
+    assert implied_vol(0.5, 110.0, 100.0, 30 / 365.0, "CE") == 0.0
+
+
+def test_implied_vol_returns_zero_on_zero_or_expired():
+    assert implied_vol(0.0, 100.0, 100.0, 30 / 365.0, "CE") == 0.0
+    assert implied_vol(5.0, 100.0, 100.0, 0.0, "CE") == 0.0
