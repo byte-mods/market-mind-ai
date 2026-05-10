@@ -437,6 +437,11 @@ async def get_options(symbol: str):
     # 1. Try NSE first (fastest, most complete)
     data = await _run(fetcher.get_option_chain, sym)
     if data and not data.get('unavailable') and data.get('calls'):
+        # Archive ATM IV for longitudinal analytics (best-effort, non-blocking)
+        try:
+            await _run(controller.record_iv_history, data)
+        except Exception:
+            pass
         return JSONResponse(_sanitize(data))
 
     # 2. Fallback to Kite if authenticated (works even when NSE is down/after hours)
@@ -444,6 +449,10 @@ async def get_options(symbol: str):
     if kite and kite.is_connected:
         kite_data = await _run(fetcher.get_option_chain_from_kite, sym, kite)
         if kite_data and kite_data.get('calls'):
+            try:
+                await _run(controller.record_iv_history, kite_data)
+            except Exception:
+                pass
             return JSONResponse(_sanitize(kite_data))
 
     # 3. Return whatever NSE gave us (error/unavailable dict) so frontend can show proper message
@@ -456,6 +465,35 @@ async def get_options_symbols():
     fetcher = get_options_fetcher()
     symbols = await _run(fetcher.get_fo_symbols)
     return JSONResponse({"symbols": symbols})
+
+
+# ─── Volatility analytics (Section 1 — IV Rank / Surface / Skew) ───────────
+
+@app.get("/api/options/iv-rank/{symbol}")
+async def get_iv_rank(symbol: str):
+    """IV rank and percentile for ``symbol`` from stored historical snapshots.
+
+    ``iv_rank`` = 0 → cheapest IV in the lookback window.
+    ``iv_rank`` = 100 → most expensive IV in the lookback window.
+
+    On first deployment the history collector needs ~20 trading days of data
+    before rank is reported; until then ``status`` is ``collecting``.
+    """
+    result = await _run(controller.get_iv_rank, symbol.upper())
+    return JSONResponse(_sanitize(result))
+
+
+@app.get("/api/options/vol/{symbol}")
+async def get_vol_analytics(symbol: str):
+    """Full volatility analytics: surface, term structure, skew, IV rank.
+
+    Fetches the raw NSE option chain directly so multi-expiry surfaces are
+    available. Falls back to Kite when NSE is down (single-expiry only).
+    """
+    result = await _run(controller.get_vol_analytics, symbol.upper())
+    if result.get("unavailable"):
+        return JSONResponse(_sanitize(result), status_code=503)
+    return JSONResponse(_sanitize(result))
 
 
 # ─── Options strategy builder (W3.3) ──────────────────────────────────────
@@ -2424,22 +2462,60 @@ async def stress_test(req: PortfolioRiskRequest):
 
 class OptimizeRequest(BaseModel):
     symbols: List[str]
-    objective: str = 'max_sharpe'  # max_sharpe | min_variance | risk_parity | equal_weight
+    objective: str = 'max_sharpe'  # max_sharpe | min_variance | risk_parity | equal_weight | hrp | black_litterman
     days: int = 252
+    views: Optional[List[Dict]] = None          # Black-Litterman views (see BL endpoint docs)
+    market_weights: Optional[Dict[str, float]] = None  # market-cap prior for BL
+
+
+class BlackLittermanRequest(BaseModel):
+    symbols: List[str]
+    days: int = 252
+    views: List[Dict] = []                      # [{assets:[str], type:absolute|relative, magnitude:float, confidence:0.5}]
+    market_weights: Optional[Dict[str, float]] = None
 
 
 @app.post("/api/optimize")
 async def optimize_portfolio(req: OptimizeRequest):
     optimizer = get_optimizer()
     def fetch():
+        bl_kwargs = {}
+        if req.objective == 'black_litterman':
+            bl_kwargs = {
+                'views': req.views or [],
+                'market_weights': req.market_weights,
+            }
         result = optimizer.optimize(
-            [s.upper() for s in req.symbols], req.objective, req.days
+            [s.upper() for s in req.symbols], req.objective, req.days, **bl_kwargs
         )
         compare = optimizer.compare_strategies(
             [s.upper() for s in req.symbols], req.days
         )
         result['strategy_comparison'] = compare
         return result
+    data = await _run(fetch)
+    return JSONResponse(_sanitize(data))
+
+
+@app.post("/api/optimize/black-litterman")
+async def optimize_black_litterman(req: BlackLittermanRequest):
+    """Black-Litterman portfolio: blend user views with market prior.
+
+    ``views`` format (list of dicts):
+      - Absolute: ``{'assets': ['TCS'], 'type': 'absolute', 'magnitude': 0.15, 'confidence': 0.7}``
+        → "TCS will return 15% annualised"
+      - Relative: ``{'assets': ['TCS','RELIANCE'], 'type': 'relative', 'magnitude': 0.03, 'confidence': 0.6}``
+        → "TCS will outperform RELIANCE by 3% annualised"
+    """
+    optimizer = get_optimizer()
+    def fetch():
+        return optimizer.optimize(
+            [s.upper() for s in req.symbols],
+            objective='black_litterman',
+            days=req.days,
+            views=req.views,
+            market_weights=req.market_weights,
+        )
     data = await _run(fetch)
     return JSONResponse(_sanitize(data))
 
@@ -2451,6 +2527,43 @@ async def efficient_frontier(req: OptimizeRequest):
         optimizer.efficient_frontier,
         [s.upper() for s in req.symbols], 20, req.days
     )
+    return JSONResponse(_sanitize(result))
+
+
+# ─── Factor Model Exposure (Section 3) ────────────────────────────────────
+
+class PortfolioRequest(BaseModel):
+    holdings: List[Dict]
+
+
+@app.get("/api/factors/{symbol}/exposure")
+async def get_factor_exposure(symbol: str):
+    """Factor Z-score exposure for a single stock.
+
+    Returns 6-factor exposure (value, size, profitability, investment,
+    momentum, quality) as Z-scores relative to the NSE universe, plus
+    percentile interpretation.
+    """
+    result = await _run(controller.get_factor_exposure, symbol.upper())
+    return JSONResponse(_sanitize(result))
+
+
+@app.post("/api/portfolio/factor-attribution")
+async def portfolio_factor_attribution(req: PortfolioRequest):
+    """Portfolio factor attribution — weighted exposure vs benchmark drift.
+
+    ``holdings`` = [{symbol, current_value? quantity? price?}].
+    Weights are normalised from ``current_value`` if present.
+    """
+    result = await _run(controller.get_portfolio_factor_attribution, req.holdings)
+    return JSONResponse(_sanitize(result))
+
+
+@app.get("/api/factors/summary")
+async def get_factor_summary():
+    """Full factor summary: universe exposures + factor momentum + stats."""
+    result = await _run(controller.get_factor_summary)
+    return JSONResponse(_sanitize(result))
     return JSONResponse(_sanitize(result))
 
 

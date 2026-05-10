@@ -1087,6 +1087,188 @@ class AppController:
         }
 
     # ----------------------------------------------------------
+    # OPTIONS VOLATILITY ANALYTICS (Section 1 — IV Rank / Surface / Skew)
+    # ----------------------------------------------------------
+
+    def record_iv_history(self, chain: Dict) -> Optional[str]:
+        """Best-effort archive of ATM IV snapshot. Never raises."""
+        try:
+            from marketmind.ml.options.vol_analytics import IVHistoryCollector
+            col = self._mongo_col("iv_history")
+            if col is not None:
+                IVHistoryCollector.ensure_indexes(col)
+            return IVHistoryCollector.save(chain, col)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"record_iv_history skipped: {e}")
+            return None
+
+    def get_iv_rank(self, symbol: str) -> Dict:
+        """IV rank + percentile for ``symbol`` from stored history."""
+        try:
+            from marketmind.ml.options.vol_analytics import iv_rank
+            col = self._mongo_col("iv_history")
+            return iv_rank(symbol, history_days=252, mongo_col=col)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"get_iv_rank error: {e}")
+            return {
+                "symbol": symbol.upper(),
+                "current_iv": None,
+                "status": "error",
+                "reason": str(e),
+            }
+
+    def get_vol_analytics(self, symbol: str) -> Dict:
+        """Full vol analytics: surface + term structure + skew + IV rank.
+
+        Fetches the raw NSE option chain directly so we can build the
+        multi-expiry surface. Falls back to Kite when NSE is down.
+        """
+        from marketmind.core.options_fetcher import get_options_fetcher
+        from marketmind.ml.options.vol_analytics import (
+            iv_rank,
+            skew_metrics,
+            term_structure,
+            vol_surface,
+        )
+
+        fetcher = get_options_fetcher()
+        sym = symbol.upper()
+
+        # 1. Try NSE raw chain
+        raw = None
+        source = "nse"
+        try:
+            session = fetcher._get_session()
+            from marketmind.core.options_fetcher import INDICES
+            if sym in INDICES:
+                url = f"{fetcher.NSE_BASE}/option-chain-indices?symbol={sym}"
+            else:
+                url = f"{fetcher.NSE_BASE}/option-chain-equities?symbol={sym}"
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+            raw = resp.json()
+        except Exception as e:
+            logger.debug(f"Vol analytics NSE fetch failed for {sym}: {e}")
+            raw = None
+
+        # 2. Kite fallback — raw isn't available, but we can build a
+        #    single-expiry surface from the parsed Kite chain.
+        kite_chain = None
+        if raw is None:
+            kite = self.kite if self.kite_is_authenticated else None
+            if kite and kite.is_connected:
+                try:
+                    kite_chain = fetcher.get_option_chain_from_kite(sym, kite)
+                    if kite_chain and not kite_chain.get("unavailable"):
+                        source = "kite"
+                except Exception as e:
+                    logger.debug(f"Vol analytics Kite fallback failed for {sym}: {e}")
+
+        # 3. Build analytics from whatever we have
+        if raw is not None:
+            surface = vol_surface(raw)
+            ts = term_structure(surface)
+            sk = skew_metrics(raw)
+        elif kite_chain is not None:
+            # Synthesise a raw-like dict from the parsed Kite chain so
+            # surface/skew functions can consume it.
+            synth_raw = {
+                "symbol": sym,
+                "records": {
+                    "underlyingValue": kite_chain.get("underlying", 0),
+                    "expiryDates": kite_chain.get("expiry_dates", []),
+                    "data": [],
+                },
+            }
+            for c in kite_chain.get("calls", []):
+                synth_raw["records"]["data"].append({
+                    "strikePrice": c["strike"],
+                    "expiryDate": kite_chain.get("expiry_dates", [""])[0],
+                    "CE": {
+                        "impliedVolatility": c.get("iv", 0),
+                        "lastPrice": c.get("ltp", 0),
+                        "openInterest": c.get("oi", 0),
+                    },
+                })
+            for p in kite_chain.get("puts", []):
+                synth_raw["records"]["data"].append({
+                    "strikePrice": p["strike"],
+                    "expiryDate": kite_chain.get("expiry_dates", [""])[0],
+                    "PE": {
+                        "impliedVolatility": p.get("iv", 0),
+                        "lastPrice": p.get("ltp", 0),
+                        "openInterest": p.get("oi", 0),
+                    },
+                })
+            surface = vol_surface(synth_raw)
+            ts = term_structure(surface)
+            sk = skew_metrics(synth_raw)
+        else:
+            return {
+                "symbol": sym,
+                "unavailable": True,
+                "reason": "Option chain unavailable — markets may be closed (09:15–15:30 IST)",
+            }
+
+        # 4. IV rank from history
+        col = self._mongo_col("iv_history")
+        rank = iv_rank(sym, history_days=252, mongo_col=col)
+
+        return {
+            "symbol": sym,
+            "source": source,
+            "unavailable": False,
+            "surface": surface,
+            "term_structure": ts,
+            "skew": sk,
+            "iv_rank": rank,
+        }
+
+    # ----------------------------------------------------------
+    # FACTOR MODEL EXPOSURE (Section 3 — Fama-French 5 for India)
+    # ----------------------------------------------------------
+
+    def get_factor_exposure(self, symbol: str) -> Dict:
+        """Factor Z-score exposure for a single stock relative to the universe."""
+        try:
+            from marketmind.analysis.factor_model import FactorEngine
+            engine = FactorEngine(price_fetcher=self.price_fetcher)
+            return engine.get_stock_exposure(symbol)
+        except Exception as e:
+            logger.warning(f"Factor exposure error for {symbol}: {e}")
+            return {
+                "symbol": symbol.upper(),
+                "status": "error",
+                "reason": str(e),
+            }
+
+    def get_portfolio_factor_attribution(self, holdings: List[Dict]) -> Dict:
+        """Weighted factor exposure of a portfolio vs benchmark."""
+        try:
+            from marketmind.analysis.factor_model import FactorEngine
+            engine = FactorEngine(price_fetcher=self.price_fetcher)
+            return engine.portfolio_attribution(holdings)
+        except Exception as e:
+            logger.warning(f"Portfolio factor attribution error: {e}")
+            return {
+                "status": "error",
+                "reason": str(e),
+            }
+
+    def get_factor_summary(self) -> Dict:
+        """Full factor summary: universe exposures + momentum + aggregate stats."""
+        try:
+            from marketmind.analysis.factor_model import FactorEngine
+            engine = FactorEngine(price_fetcher=self.price_fetcher)
+            return engine.factor_summary()
+        except Exception as e:
+            logger.warning(f"Factor summary error: {e}")
+            return {
+                "status": "error",
+                "reason": str(e),
+            }
+
+    # ----------------------------------------------------------
     # ORDERS
     # ----------------------------------------------------------
 

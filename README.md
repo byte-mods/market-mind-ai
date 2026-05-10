@@ -68,12 +68,16 @@ The system is built around three principles:
 | | Black-Scholes options pricing + 5 Greeks | ✅ |
 | | 9 strategy templates (covered call, condor, calendar, ratio, …) | ✅ |
 | | Vectorised payoff curves, break-evens, signed-additive Greeks | ✅ |
+| | **IV rank / percentile** (252-day rolling, Mongo-backed) | ✅ |
+| | **Volatility surface** — multi-expiry (strike, expiry, IV) grid | ✅ |
+| | **Term structure** — contango / backwardation / flat detection | ✅ |
+| | **Skew analytics** — 25Δ risk reversal, put/call skew index, smile shape | ✅ |
 | | Historical + parametric VaR, stress scenarios | ✅ |
 | **Indian moat** | Tax-aware rebalancer (STCG/LTCG, ₹1.25L exemption, FY tracking) | ✅ |
 | | Multi-asset (MCX commodities, USD/INR, INR-paired crypto) | ✅ |
 | | SEBI compliance gate (insider window, position limits, audit log) | ✅ |
 | **Frontier** | Causal Bayesian network (PC-algorithm + linear-Gaussian counterfactuals) | ✅ |
-| | Hierarchical Risk Parity + Black-Litterman views | ⏳ |
+| | Hierarchical Risk Parity + Black-Litterman views | ✅ |
 | **UI** | Editorial-dark dashboard (Instrument Serif + Geist + JetBrains Mono) | ✅ |
 | | Live ticker strip, sparklines, sector heatmap (Nifty 500) | ✅ |
 | | WebSocket push (30s tick), toast notifications | ✅ |
@@ -278,8 +282,9 @@ Highlight tour:
 |---|---|---|
 | `GET` | `/api/portfolio` | Live holdings + day positions |
 | `GET` | `/api/portfolio/equity-curve` | Historical NAV curve |
-| `POST` | `/api/optimize` | Markowitz portfolio optimisation |
+| `POST` | `/api/optimize` | Portfolio optimisation (max_sharpe, min_variance, risk_parity, equal_weight, hrp, black_litterman) |
 | `POST` | `/api/optimize/frontier` | Efficient frontier (20 points) |
+| `POST` | `/api/optimize/black-litterman` | Black-Litterman with user views + market prior |
 | `POST` | `/api/risk/portfolio` | VaR + stress + sector betas |
 | `POST` | `/api/backtest/walkforward` | Anchored walk-forward Sharpe distribution |
 | `GET` | `/api/forecast/{sym}?horizon=N&model=ensemble` | Calibrated price forecast + 80/95 PI |
@@ -290,6 +295,8 @@ Highlight tour:
 | `GET` | `/api/events?since=...&min_severity=60` | Material corporate events |
 | `GET` | `/api/altdata` | Reddit + ValuePickr + SIAM + GST + IIP + Trends |
 | `POST` | `/api/options/strategy` | Build & analyse a 9-template options strategy |
+| `GET` | `/api/options/iv-rank/{sym}` | IV rank [0,100] + percentile from 252-day history |
+| `GET` | `/api/options/vol/{sym}` | Full vol analytics: surface + term structure + skew + IV rank |
 | `GET` | `/api/causal/nodes` | Causal network nodes + current values + DAG edges |
 | `POST` | `/api/causal/whatif` | Counterfactual estimate: ``do(node=value) → target`` |
 | `GET` | `/api/market/heatmap` | 499-stock Nifty 500 heatmap |
@@ -345,10 +352,11 @@ marketmind/
 │   │   │   ├── meta_stacker.py        # softmax BUY/SELL/HOLD
 │   │   │   ├── evaluator.py           # PI coverage harness
 │   │   │   └── cache.py               # Mongo forecast_cache (24h/5m TTL)
-│   │   └── options/                   # BS pricing + 9 strategy templates
+│   │   └── options/                   # BS pricing + 9 strategy templates + vol analytics
 │   │       ├── pricing.py
 │   │       ├── strategies.py
-│   │       └── builder.py             # vectorised payoff curves
+│   │       ├── builder.py             # vectorised payoff curves
+│   │       └── vol_analytics.py       # IV rank, surface, term structure, skew
 │   ├── vectordb/                      # ChromaDB persistence
 │   └── models/                        # PyTorch checkpoints (gitignored)
 │

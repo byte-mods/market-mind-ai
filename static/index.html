@@ -1006,6 +1006,7 @@ h3{
       <button class="nav-btn" onclick="nav('earnings')">Earnings</button>
       <button class="nav-btn" onclick="nav('options')">Options Chain</button>
       <button class="nav-btn" onclick="nav('fo')">F&amp;O Sentiment</button>
+      <button class="nav-btn" onclick="nav('factors')">Factor Exposure</button>
     </div>
   </div>
 
@@ -1163,7 +1164,7 @@ h3{
       <datalist id="opt-symbols-list"></datalist>
       <select id="opt-expiry"></select>
       <button onclick="loadOptions()" class="primary">Load</button>
-      <button onclick="_showDemoOptions()" style="font-size:11px;padding:4px 10px;background:transparent;border:1px solid var(--border-2);border-radius:6px;color:var(--muted);cursor:pointer;">Demo</button>
+
     </div>
   </div>
 
@@ -1379,11 +1380,12 @@ h3{
     </div>
   </div>
 
-  <!-- Tabs: Holdings | Positions | AI Insights -->
+  <!-- Tabs: Holdings | Positions | AI Insights | Factor Attribution -->
   <div class="tab-group" style="margin-top:14px;">
     <button class="tab active" onclick="pfTab('holdings',this)">Holdings</button>
     <button class="tab" onclick="pfTab('positions',this)">Positions (Day)</button>
     <button class="tab" onclick="pfTab('insights',this)">🤖 AI Insights</button>
+    <button class="tab" onclick="pfTab('factors',this)">📊 Factor Attribution</button>
   </div>
 
   <div id="pf-holdings-tab">
@@ -1406,6 +1408,14 @@ h3{
     <div class="card" style="padding:16px;">
       <div id="pf-insights-content" style="white-space:pre-wrap;line-height:1.8;font-size:13px;">
         Click <strong>Refresh</strong> above to load AI portfolio insights.
+      </div>
+    </div>
+  </div>
+
+  <div id="pf-factors-tab" style="display:none;">
+    <div class="card" style="padding:16px;">
+      <div id="pf-factors-content" style="font-size:13px;">
+        <div class="muted" style="padding:12px 0;">Click <strong>Refresh</strong> above to load portfolio factor attribution.</div>
       </div>
     </div>
   </div>
@@ -1509,6 +1519,72 @@ h3{
   <div class="chart-wrap">
     <h3>Nifty OI — Calls vs Puts</h3>
     <canvas id="oi-calls-puts-chart"></canvas>
+  </div>
+</section>
+
+<!-- ══════════════════ FACTOR EXPOSURE ══════════════════ -->
+<section id="s-factors" class="section">
+  <div class="section-header">
+    <h2>Factor Exposure — Fama-French 5 + Quality</h2>
+    <button onclick="loadFactorSummary()">↻ Refresh</button>
+  </div>
+
+  <div class="row" style="margin-bottom:14px;gap:14px;">
+    <!-- Stock lookup -->
+    <div class="grow card">
+      <h3 style="margin-bottom:10px;">🔍 Stock Factor Lookup</h3>
+      <div style="display:flex;gap:8px;margin-bottom:14px;">
+        <input type="text" id="factor-symbol" placeholder="e.g. RELIANCE" style="width:160px;text-transform:uppercase;"
+               onkeydown="if(event.key==='Enter')loadFactorExposure()">
+        <button class="primary" onclick="loadFactorExposure()">Look Up</button>
+      </div>
+      <div id="factor-stock-result" style="display:none;">
+        <div style="font-size:13px;font-weight:700;margin-bottom:10px;" id="factor-stock-name"></div>
+        <div id="factor-stock-bars"></div>
+        <div style="margin-top:10px;font-size:11px;color:var(--muted);" id="factor-stock-pct"></div>
+      </div>
+      <div id="factor-stock-placeholder" class="muted" style="padding:20px 0;">
+        Enter a symbol to see its 6-factor Z-score exposure relative to the NSE universe.
+      </div>
+    </div>
+
+    <!-- Portfolio attribution -->
+    <div class="grow card">
+      <h3 style="margin-bottom:10px;">📊 Portfolio Factor Attribution</h3>
+      <div id="factor-pf-result" style="display:none;">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:10px;" id="factor-pf-meta"></div>
+        <div id="factor-pf-bars"></div>
+        <div style="margin-top:10px;font-size:11px;color:var(--muted);" id="factor-pf-drift"></div>
+      </div>
+      <div id="factor-pf-placeholder" class="muted" style="padding:20px 0;">
+        Loading portfolio factor attribution...
+      </div>
+    </div>
+  </div>
+
+  <!-- Factor summary -->
+  <div class="card">
+    <h3 style="margin-bottom:10px;">🌍 Universe Factor Summary</h3>
+    <div id="factor-summary-result" style="display:none;">
+      <div class="row" style="gap:14px;margin-bottom:14px;">
+        <div style="flex:1;">
+          <div class="label muted" style="font-size:11px;margin-bottom:6px;">Factor Momentum (63-day)</div>
+          <div id="factor-momentum-table"></div>
+        </div>
+        <div style="flex:1;">
+          <div class="label muted" style="font-size:11px;margin-bottom:6px;">Universe Stats</div>
+          <div id="factor-stats-table"></div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:8px;">
+        <strong>Methodology:</strong> Cross-sectional Z-scores (median / MAD) vs 60-stock NSE universe.
+        Momentum = 12-1 month return. Quality = ROCE penalised by leverage.
+        Factor momentum = Spearman correlation between factor score and subsequent return.
+      </div>
+    </div>
+    <div id="factor-summary-placeholder" class="muted" style="padding:20px 0;">
+      Click Refresh to load universe factor summary.
+    </div>
   </div>
 </section>
 
@@ -2049,7 +2125,7 @@ h3{
           <span>Symbols (comma-separated)</span>
           <span id="opt-symbols-hint" class="muted" style="font-size:11px;">Loading your holdings…</span>
         </label>
-        <input type="text" id="opt-symbols" value="RELIANCE,TCS,HDFCBANK,INFY,ICICIBANK,SBIN,ITC,AXISBANK" style="width:100%;" oninput="_optSymbolsEdited=true;">
+        <input type="text" id="opt-symbols" value="" placeholder="Enter symbols or load from portfolio…" style="width:100%;" oninput="_optSymbolsEdited=true;">
         <div style="margin-top:6px;display:flex;gap:8px;">
           <button type="button" onclick="reloadOptimizerHoldings()" style="font-size:11px;padding:4px 10px;background:transparent;border:1px solid var(--border-2);border-radius:6px;color:var(--text-2);cursor:pointer;">↻ Reload from holdings</button>
         </div>
@@ -2840,6 +2916,7 @@ function loadSection(name) {
     case 'rl': loadRLSignals(); break;
     case 'earnings': loadEarnings(); break;
     case 'fo': loadFOSentiment(); break;
+    case 'factors': loadFactorSummary(); break;
     case 'backtest': /* on demand */ break;
     case 'alerts': loadAlerts(); break;
     case 'orders': loadOrders(); break;
@@ -3200,38 +3277,6 @@ function showStockModal(sym) {
 // OPTIONS CHAIN
 // ═══════════════════════════════════════════════════════════════════════
 let _optData = null;
-function _syntheticOptions(sym, basePrice) {
-  const step = basePrice > 5000 ? 100 : basePrice > 1000 ? 50 : 20;
-  const atm = Math.round(basePrice / step) * step;
-  const strikes = [];
-  for (let i = -8; i <= 8; i++) strikes.push(atm + i * step);
-  const calls = strikes.map((k, i) => {
-    const dist = (k - atm) / step;
-    const oi = Math.round((800000 - Math.abs(dist) * 80000) * (0.8 + Math.random() * 0.4));
-    const iv = (18 + Math.abs(dist) * 1.5 + Math.random() * 2).toFixed(1);
-    const ltp = Math.max(0.5, (atm - k + step * 1.5) * 0.35 + Math.random() * 5).toFixed(2);
-    return {strike: k, oi: Math.max(10000, oi), chg_oi: Math.round((Math.random()-0.4)*50000), volume: Math.round(oi*0.3), iv, ltp: parseFloat(ltp)};
-  });
-  const puts = strikes.map((k, i) => {
-    const dist = (atm - k) / step;
-    const oi = Math.round((750000 - Math.abs(dist) * 70000) * (0.8 + Math.random() * 0.4));
-    const iv = (17 + Math.abs(dist) * 1.5 + Math.random() * 2).toFixed(1);
-    const ltp = Math.max(0.5, (k - atm + step * 1.5) * 0.35 + Math.random() * 5).toFixed(2);
-    return {strike: k, oi: Math.max(10000, oi), chg_oi: Math.round((Math.random()-0.5)*50000), volume: Math.round(oi*0.3), iv, ltp: parseFloat(ltp)};
-  });
-  const totalCallOI = calls.reduce((s,c)=>s+c.oi,0);
-  const totalPutOI = puts.reduce((s,p)=>s+p.oi,0);
-  const pcr = (totalPutOI / totalCallOI).toFixed(2);
-  const today = new Date();
-  const expiries = [0,1,2].map(w => { const d=new Date(today); d.setDate(d.getDate()+(4-d.getDay()+7*w)%7+1); return d.toISOString().slice(0,10); });
-  return {
-    symbol: sym, underlying: basePrice, atm_strike: atm,
-    pcr: parseFloat(pcr), sentiment: parseFloat(pcr) > 1.2 ? 'Bullish' : parseFloat(pcr) < 0.8 ? 'Bearish' : 'Neutral',
-    max_pain: atm - step, total_call_oi: totalCallOI, total_put_oi: totalPutOI,
-    expiry_dates: expiries, calls, puts, _demo: true
-  };
-}
-
 async function loadFOSymbols() {
   try {
     const data = await API.get('/options/symbols');
@@ -3259,7 +3304,6 @@ async function loadOptions() {
       `<tr><td colspan="11" style="text-align:center;padding:24px;color:var(--muted);">
         <div>⚠️ ${e.message || 'Options chain unavailable'}</div>
         <div style="font-size:11px;margin-top:6px;">Markets may be closed or NSE feed is delayed.</div>
-        <button onclick="_showDemoOptions()" style="margin-top:10px;padding:6px 14px;border-radius:6px;border:1px solid var(--border-2);background:var(--surface);color:var(--text);cursor:pointer;">Show Demo Data</button>
       </td></tr>`;
     destroyChart('oi');
     toast(`Options chain unavailable for ${sym}`, 'red');
@@ -3350,15 +3394,7 @@ function renderOptionsAdvisor(d) {
   }
 }
 
-function _showDemoOptions() {
-  const sym = document.getElementById('opt-symbol').value.trim().toUpperCase() || 'NIFTY';
-  API.get(`/stocks/${sym}/quote`).catch(() => null).then(q => {
-    const price = q?.ltp || q?.last_price || 2000;
-    _optData = _syntheticOptions(sym, price);
-    renderOptionsChain(_optData);
-    toast(`Demo options for ${sym}`, 'orange');
-  });
-}
+
 
 function renderOptionsChain(d) {
   document.getElementById('opt-underlying').textContent = '₹' + fmt(d.underlying, 2);
@@ -3750,13 +3786,10 @@ function renderEquityCurve(d) {
 function renderHoldings(holdings) {
   const el = document.getElementById('holdings-list');
   if (!holdings.length) {
-    el.innerHTML = '<div class="muted" style="padding:16px">No holdings (Kite not authenticated or no positions)</div>';
-    // Demo pie
+    el.innerHTML = '<div class="muted" style="padding:16px">No holdings found. Connect Kite or add symbols to your watchlist.</div>';
     destroyChart('portpie');
     const ctx = document.getElementById('portfolio-pie').getContext('2d');
-    const demo = ['RELIANCE','TCS','HDFCBANK','INFY','ITC'];
-    const vals = [22,18,16,14,12];
-    _charts['portpie'] = new Chart(ctx, {type:'doughnut', data:{labels:demo, datasets:[{data:vals, backgroundColor:['#3fb950','#58a6ff','#d29922','#bc8cff','#f85149'], borderWidth:0}]}, options:{plugins:{legend:{labels:{color:'#8b949e'}}}}});
+    _charts['portpie'] = new Chart(ctx, {type:'doughnut', data:{labels:['No data'], datasets:[{data:[1], backgroundColor:['#30363d'], borderWidth:0}]}, options:{plugins:{legend:{display:false}}}});
     return;
   }
   el.innerHTML = holdings.map(h => {
@@ -3783,21 +3816,9 @@ async function loadRLSignals(forceRefresh = false) {
     const mf = multiframe || {};
     const hasSignals = Object.values(mf).some(arr => Array.isArray(arr) && arr.length > 0);
     if (!hasSignals) {
-      // Synthetic demo signals when Kite/NSE unavailable
-      const demo = {
-        intraday: [
-          {symbol:'RELIANCE',action:'BUY',confidence:0.72,entry:2845.5,target:2890.0,sl:2820.0,reason:'RSI oversold bounce + VWAP support'},
-          {symbol:'TCS',action:'SELL',confidence:0.65,entry:3920.0,target:3870.0,sl:3950.0,reason:'MACD bearish crossover + resistance'},
-        ],
-        swing: [
-          {symbol:'HDFCBANK',action:'BUY',confidence:0.78,entry:1642.0,target:1710.0,sl:1610.0,reason:'Golden cross + FII accumulation'},
-          {symbol:'INFY',action:'BUY',confidence:0.61,entry:1485.0,target:1540.0,sl:1460.0,reason:'Bollinger squeeze breakout'},
-        ],
-        positional: [
-          {symbol:'ICICIBANK',action:'BUY',confidence:0.82,entry:1095.0,target:1180.0,sl:1060.0,reason:'Strong ROE + sector tailwind'},
-        ]
-      };
-      renderMultiframeSignals(demo);
+      renderMultiframeSignals({});
+      document.getElementById('rl-intraday').innerHTML =
+        '<div class="muted" style="padding:10px">No signals available. <button onclick="nav(\'aitrain\')" style="background:transparent;border:none;color:var(--blue);cursor:pointer;text-decoration:underline;">Train models →</button></div>';
     } else {
       renderMultiframeSignals(mf);
     }
@@ -3850,26 +3871,13 @@ async function loadEarnings() {
     if (data && Array.isArray(data) && data.length > 0) {
       renderEarnings(data);
     } else {
-      renderEarnings(_demoEarnings());
+      document.getElementById('earnings-list').innerHTML =
+        '<div class="muted" style="padding:20px">No upcoming earnings results found for the selected period.</div>';
     }
   } catch(e) {
-    renderEarnings(_demoEarnings());
+    document.getElementById('earnings-list').innerHTML =
+      '<div class="muted" style="padding:20px">Unable to load earnings calendar. Please try again later.</div>';
   }
-}
-
-function _demoEarnings() {
-  const today = new Date();
-  const fmt = d => d.toISOString().slice(0,10);
-  const next = (n) => { const d = new Date(today); d.setDate(d.getDate()+n); return fmt(d); };
-  return [
-    {symbol:'TCS',company_name:'Tata Consultancy Services',ex_date:next(2),event:'Q4 Results',sector:'IT',eps_est:28.5},
-    {symbol:'INFY',company_name:'Infosys Ltd',ex_date:next(4),event:'Q4 Results',sector:'IT',eps_est:16.2},
-    {symbol:'HDFCBANK',company_name:'HDFC Bank Ltd',ex_date:next(6),event:'Q4 Results',sector:'Banking',eps_est:21.4},
-    {symbol:'RELIANCE',company_name:'Reliance Industries',ex_date:next(9),event:'Q4 Results',sector:'Energy',eps_est:32.1},
-    {symbol:'ICICIBANK',company_name:'ICICI Bank Ltd',ex_date:next(11),event:'Q4 Results',sector:'Banking',eps_est:14.8},
-    {symbol:'WIPRO',company_name:'Wipro Ltd',ex_date:next(13),event:'Q4 Results',sector:'IT',eps_est:6.2},
-    {symbol:'BAJFINANCE',company_name:'Bajaj Finance',ex_date:next(15),event:'Q4 Results',sector:'NBFC',eps_est:38.5},
-  ];
 }
 
 function renderEarnings(data) {
@@ -4042,6 +4050,231 @@ function drawGauge(value) {
   ctx.arc(cx,cy,6,0,2*Math.PI);
   ctx.fillStyle='#e6edf3';
   ctx.fill();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FACTOR EXPOSURE
+// ═══════════════════════════════════════════════════════════════════════
+
+function _factorBarHtml(label, z, pct, opts={}) {
+  const min = opts.min ?? -3;
+  const max = opts.max ?? 3;
+  const clamped = Math.max(min, Math.min(max, z || 0));
+  const pctPos = ((clamped - min) / (max - min)) * 100;
+  const color = z > 1 ? '#3fb950' : z > 0.5 ? '#7ee787' : z > -0.5 ? '#8b949e' : z > -1 ? '#f0883e' : '#f85149';
+  const zTxt = z != null ? (z > 0 ? '+' : '') + z.toFixed(2) : '—';
+  const pctTxt = pct != null ? ` (p${Math.round(pct)})` : '';
+  return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:12px;">
+    <div style="width:90px;text-align:right;font-weight:600;">${label}</div>
+    <div style="flex:1;position:relative;height:18px;background:var(--surface);border-radius:4px;overflow:hidden;">
+      <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--border);z-index:1;"></div>
+      <div style="position:absolute;top:2px;bottom:2px;border-radius:3px;transition:all .4s ease;background:${color};left:${clamped>=0?'50%':pctPos+'%'};width:${Math.abs(clamped)/(max-min)*100+'%'};opacity:.9;"></div>
+    </div>
+    <div style="width:90px;font-size:11px;color:var(--muted);">${zTxt}${pctTxt}</div>
+  </div>`;
+}
+
+function _factorBadge(z) {
+  if (z == null) return `<span class="badge blue">n/a</span>`;
+  if (z >= 1.5) return `<span class="badge green">Strong +</span>`;
+  if (z >= 0.5) return `<span class="badge" style="background:rgba(63,217,127,.12);color:#7ee787;border-color:rgba(63,217,127,.2);">Mild +</span>`;
+  if (z > -0.5) return `<span class="badge blue">Neutral</span>`;
+  if (z > -1.5) return `<span class="badge" style="background:rgba(255,138,61,.12);color:#f0883e;border-color:rgba(255,138,61,.2);">Mild −</span>`;
+  return `<span class="badge red">Strong −</span>`;
+}
+
+async function loadFactorExposure() {
+  const sym = document.getElementById('factor-symbol').value.trim().toUpperCase();
+  if (!sym) { toast('Enter a symbol', 'red'); return; }
+  const resEl = document.getElementById('factor-stock-result');
+  const phEl = document.getElementById('factor-stock-placeholder');
+  resEl.style.display = 'none'; phEl.style.display = 'block';
+  phEl.textContent = 'Loading...';
+  try {
+    const data = await API.get(`/factors/${sym}/exposure`);
+    if (data.status !== 'ready') {
+      phEl.textContent = data.reason || 'Data unavailable for this symbol.';
+      return;
+    }
+    phEl.style.display = 'none'; resEl.style.display = 'block';
+    document.getElementById('factor-stock-name').textContent = `${data.symbol} — Factor Exposure`;
+    const exp = data.exposures || {};
+    const pct = data.percentiles || {};
+    const factors = [
+      ['Value', 'value'], ['Size', 'size'], ['Profitability', 'profitability'],
+      ['Investment', 'investment'], ['Momentum', 'momentum'], ['Quality', 'quality']
+    ];
+    document.getElementById('factor-stock-bars').innerHTML = factors.map(([label, key]) =>
+      _factorBarHtml(label, exp[key], pct[key])
+    ).join('');
+    const badges = factors.map(([label, key]) => `<span style="margin-right:8px;">${label}: ${_factorBadge(exp[key])}</span>`).join('');
+    document.getElementById('factor-stock-pct').innerHTML =
+      `<div style="display:flex;flex-wrap:wrap;gap:4px;">${badges}</div>`;
+  } catch (e) {
+    phEl.textContent = 'Error: ' + e.message;
+    phEl.style.display = 'block';
+  }
+}
+
+function _renderFactorAttribution(data, barsContainerId, metaId, driftId) {
+  const pfFac = data.portfolio_factors || {};
+  const bmFac = data.benchmark_factors || {};
+  const drift = data.factor_drift || {};
+  const factors = [
+    ['Value', 'value'], ['Size', 'size'], ['Profitability', 'profitability'],
+    ['Investment', 'investment'], ['Momentum', 'momentum'], ['Quality', 'quality']
+  ];
+  const barsHtml = factors.map(([label, key]) => {
+    const z = pfFac[key]; const bm = bmFac[key];
+    const d = drift[key];
+    const dTxt = d != null ? ` <span style="color:${d>0?'var(--green)':'var(--red)'};">Δ${d>0?'+':''}${d.toFixed(2)}</span>` : '';
+    return _factorBarHtml(label, z, null) + `<div style="margin:-4px 0 8px 98px;font-size:10px;color:var(--muted);">Benchmark: ${bm != null ? bm.toFixed(2) : '—'}${dTxt}</div>`;
+  }).join('');
+  const el = document.getElementById(barsContainerId);
+  if (el) el.innerHTML = barsHtml;
+
+  const covered = data.holdings_covered || 0;
+  const total = data.holdings_total || 0;
+  const metaEl = document.getElementById(metaId);
+  if (metaEl) metaEl.textContent =
+    `Based on ${covered}/${total} holdings with data. Weights normalised from current value.`;
+
+  const interp = data.interpretation || '';
+  const driftEl = document.getElementById(driftId);
+  if (driftEl) driftEl.innerHTML =
+    interp ? `<div style="background:var(--surface);border-radius:6px;padding:8px 10px;font-size:11px;">${interp}</div>` : '';
+}
+
+async function loadPortfolioFactorAttribution() {
+  const resEl = document.getElementById('factor-pf-result');
+  const phEl = document.getElementById('factor-pf-placeholder');
+  try {
+    const pf = await API.get('/portfolio').catch(() => null);
+    const holdings = (pf?.holdings || []).map(h => ({
+      symbol: h.symbol || h.tradingsymbol,
+      current_value: h.current_value || (h.quantity * h.last_price)
+    })).filter(h => h.symbol && h.current_value > 0);
+    if (!holdings.length) {
+      phEl.textContent = 'No portfolio holdings found. Add holdings to see factor attribution.';
+      return;
+    }
+    const data = await API.post('/portfolio/factor-attribution', { holdings });
+    if (data.status !== 'ready') {
+      phEl.textContent = data.reason || 'Could not compute factor attribution.';
+      return;
+    }
+    phEl.style.display = 'none'; resEl.style.display = 'block';
+    _renderFactorAttribution(data, 'factor-pf-bars', 'factor-pf-meta', 'factor-pf-drift');
+  } catch (e) {
+    phEl.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function loadPortfolioFactorAttributionInline() {
+  const contentEl = document.getElementById('pf-factors-content');
+  if (!contentEl) return;
+  contentEl.innerHTML = '<div class="muted" style="padding:12px 0;">Loading factor attribution...</div>';
+  try {
+    const pf = await API.get('/portfolio').catch(() => null);
+    const holdings = (pf?.holdings || []).map(h => ({
+      symbol: h.symbol || h.tradingsymbol,
+      current_value: h.current_value || (h.quantity * h.last_price)
+    })).filter(h => h.symbol && h.current_value > 0);
+    if (!holdings.length) {
+      contentEl.innerHTML = '<div class="muted" style="padding:12px 0;">No portfolio holdings found. Add holdings to see factor attribution.</div>';
+      return;
+    }
+    const data = await API.post('/portfolio/factor-attribution', { holdings });
+    if (data.status !== 'ready') {
+      contentEl.innerHTML = '<div class="muted" style="padding:12px 0;">' + (data.reason || 'Could not compute factor attribution.') + '</div>';
+      return;
+    }
+    const pfFac = data.portfolio_factors || {};
+    const bmFac = data.benchmark_factors || {};
+    const drift = data.factor_drift || {};
+    const factors = [
+      ['Value', 'value'], ['Size', 'size'], ['Profitability', 'profitability'],
+      ['Investment', 'investment'], ['Momentum', 'momentum'], ['Quality', 'quality']
+    ];
+    const covered = data.holdings_covered || 0;
+    const total = data.holdings_total || 0;
+    const interp = data.interpretation || '';
+    contentEl.innerHTML = `
+      <div style="font-size:11px;color:var(--muted);margin-bottom:10px;">
+        Based on ${covered}/${total} holdings with data. Weights normalised from current value.
+      </div>
+      <div>${factors.map(([label, key]) => {
+        const z = pfFac[key]; const bm = bmFac[key]; const d = drift[key];
+        const dTxt = d != null ? ` <span style="color:${d>0?'var(--green)':'var(--red)'};">Δ${d>0?'+':''}${d.toFixed(2)}</span>` : '';
+        return _factorBarHtml(label, z, null) + `<div style="margin:-4px 0 8px 98px;font-size:10px;color:var(--muted);">Benchmark: ${bm != null ? bm.toFixed(2) : '—'}${dTxt}</div>`;
+      }).join('')}</div>
+      ${interp ? `<div style="background:var(--surface);border-radius:6px;padding:8px 10px;font-size:11px;margin-top:8px;">${interp}</div>` : ''}
+    `;
+  } catch (e) {
+    contentEl.innerHTML = '<div class="muted" style="padding:12px 0;">Error: ' + e.message + '</div>';
+  }
+}
+
+async function loadFactorSummary() {
+  const resEl = document.getElementById('factor-summary-result');
+  const phEl = document.getElementById('factor-summary-placeholder');
+  const stockRes = document.getElementById('factor-stock-result');
+  const stockPh = document.getElementById('factor-stock-placeholder');
+  const pfRes = document.getElementById('factor-pf-result');
+  const pfPh = document.getElementById('factor-pf-placeholder');
+
+  phEl.textContent = 'Loading...'; stockPh.textContent = 'Loading...'; pfPh.textContent = 'Loading...';
+  phEl.style.display = 'block'; resEl.style.display = 'none';
+  stockPh.style.display = 'block'; stockRes.style.display = 'none';
+  pfPh.style.display = 'block'; pfRes.style.display = 'none';
+
+  try {
+    // Parallel load
+    const [summary, pfAttribution, stockExposure] = await Promise.all([
+      API.get('/factors/summary').catch(() => null),
+      loadPortfolioFactorAttribution().catch(() => null),
+      (async () => {
+        const sym = document.getElementById('factor-symbol').value.trim().toUpperCase();
+        if (sym) await loadFactorExposure();
+      })().catch(() => null),
+    ]);
+
+    if (summary && summary.status !== 'error') {
+      phEl.style.display = 'none'; resEl.style.display = 'block';
+      const mom = summary.momentum || {};
+      const stats = summary.stats || {};
+      const factors = ['value','size','profitability','investment','momentum','quality'];
+
+      // Momentum table
+      document.getElementById('factor-momentum-table').innerHTML = `<table style="width:100%;font-size:12px;">
+        <thead><tr><th>Factor</th><th>Corr</th><th>p-value</th><th>Regime</th><th>Top Q Return</th></tr></thead>
+        <tbody>${factors.map(f => {
+          const m = mom[f] || {};
+          const c = m.correlation; const p = m.pvalue; const r = m.regime; const tq = m.top_quintile_return;
+          const cColor = c > 0.1 ? 'var(--green)' : c < -0.1 ? 'var(--red)' : 'var(--muted)';
+          return `<tr><td style="text-transform:capitalize;font-weight:600;">${f}</td>
+            <td style="color:${cColor};">${c != null ? (c>0?'+':'')+c.toFixed(3) : '—'}</td>
+            <td>${p != null ? p.toFixed(3) : '—'}</td>
+            <td><span class="badge ${r==='positive'?'green':r==='negative'?'red':'blue'}">${r || '—'}</span></td>
+            <td>${tq != null ? (tq>0?'+':'')+tq.toFixed(1)+'%' : '—'}</td></tr>`;
+        }).join('')}</tbody></table>`;
+
+      // Stats table
+      document.getElementById('factor-stats-table').innerHTML = `<table style="width:100%;font-size:12px;">
+        <thead><tr><th>Factor</th><th>Mean Z</th><th>Std Z</th><th>Range</th></tr></thead>
+        <tbody>${factors.map(f => {
+          const s = stats[f] || {};
+          return `<tr><td style="text-transform:capitalize;font-weight:600;">${f}</td>
+            <td>${s.mean != null ? s.mean.toFixed(2) : '—'}</td>
+            <td>${s.std != null ? s.std.toFixed(2) : '—'}</td>
+            <td>${s.min != null && s.max != null ? s.min.toFixed(2)+' … '+s.max.toFixed(2) : '—'}</td></tr>`;
+        }).join('')}</tbody></table>`;
+    } else {
+      phEl.textContent = summary?.reason || 'Could not load factor summary.';
+    }
+  } catch (e) {
+    phEl.textContent = 'Error: ' + e.message;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4815,20 +5048,19 @@ async function reloadOptimizerHoldings(announce = true) {
       _optHoldingsLoaded = true;
       if (announce) toast(`Loaded ${symbols.length} symbols from your portfolio`, 'green');
     } else {
-      // Don't overwrite the seeded default list when there's nothing useful to swap in
       hint.textContent = holdings.length
-        ? 'Need at least 2 holdings to optimize — using defaults'
-        : 'No holdings detected — using defaults (connect Kite in Settings)';
+        ? 'Need at least 2 holdings to optimize'
+        : 'No holdings detected — connect Kite in Settings or enter symbols manually';
     }
   } catch (e) {
-    hint.textContent = 'Could not load holdings — using defaults';
+    hint.textContent = 'Could not load holdings — enter symbols manually';
   }
 }
 
 async function runOptimizer() {
   const symsRaw = document.getElementById('opt-symbols').value;
   const syms = symsRaw.split(',').map(s=>s.trim().toUpperCase()).filter(s=>s);
-  if (syms.length < 2) { toast('Need at least 2 symbols','red'); return; }
+  if (syms.length < 2) { toast('Enter at least 2 symbols, or load from portfolio','red'); return; }
   const obj = document.getElementById('opt-objective').value;
   const days = parseInt(document.getElementById('opt-days').value);
   toast('Optimizing portfolio...','blue');
@@ -5514,12 +5746,13 @@ function loadSection(name) {
 // PORTFOLIO TABS
 // ═══════════════════════════════════════════════════════════════════════
 function pfTab(name, btn) {
-  ['holdings', 'positions', 'insights'].forEach(t => {
+  ['holdings', 'positions', 'insights', 'factors'].forEach(t => {
     document.getElementById('pf-' + t + '-tab').style.display = t === name ? 'block' : 'none';
   });
   document.querySelectorAll('#s-portfolio .tab').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   if (name === 'positions') loadPositions();
+  if (name === 'factors') loadPortfolioFactorAttributionInline();
 }
 
 async function loadPositions() {
@@ -5954,6 +6187,8 @@ async function loadPortfolio() {
     if (posData?.insights) {
       document.getElementById('pf-insights-content').textContent = posData.insights;
     }
+    // Pre-load factor attribution for the portfolio tab
+    loadPortfolioFactorAttributionInline().catch(() => {});
     // Update P&L from positions if Kite available
     if (posData?.authenticated && posData.total_pnl !== undefined) {
       const pnl = posData.total_pnl;

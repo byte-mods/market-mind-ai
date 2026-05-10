@@ -242,7 +242,7 @@ Time to "noticeably more intelligent": end of Wave 1 (~10 days). Time to "instit
 | W4.1 | Tax rebalancer | – | ✅ | 2026-04-28 | 2026-04-28 | – |
 | W4.2 | Multi-asset | – | ✅ | 2026-05-07 | 2026-05-07 | – |
 | W5.1 | Causal Bayes net | – | ✅ | 2026-05-07 | 2026-05-07 | – |
-| W5.2 | HRP + B-L | – | ⏳ | – | – | – |
+| W5.2 | HRP + B-L | – | ✅ | 2026-05-10 | 2026-05-10 | – |
 | W5.3 | SEBI compliance | – | ✅ | 2026-04-28 | 2026-04-28 | – |
 
 ---
